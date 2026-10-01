@@ -915,6 +915,7 @@ std::string PassGroup::name() const {
 }
 
 int PassGroup::weight() const {
+    if (weightOverride >= 0) return weightOverride;
     int w = 0;
     for (auto* p : passes) w = std::max(w, p->weight);
     return w;
@@ -923,6 +924,7 @@ int PassGroup::weight() const {
 bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup>& out,
                     std::string& err) {
     out.clear();
+    bool none = false;
     auto addAll = [&]() {
         for (auto& p : allPasses()) out.push_back({{&p}});
     };
@@ -940,6 +942,10 @@ bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup
                 addAll();
                 continue;
             }
+            if (g == "none") {
+                none = true;
+                continue;
+            }
             PassGroup grp;
             std::stringstream names(g);
             std::string n;
@@ -954,7 +960,7 @@ bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup
             if (!grp.passes.empty()) out.push_back(grp);
         }
     }
-    if (out.empty()) {
+    if (out.empty() && !none) {
         err = "no passes given";
         return false;
     }

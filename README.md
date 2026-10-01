@@ -2,9 +2,14 @@
 
 Brute-forces source permutations of a single C++ function until its compiled code matches a
 target object, or gets closer to it. It is built for matching decompilation projects such as
-[gta2_re](https://github.com/CriminalRETeam/gta2_re) (MSVC 6), and works like
-[decomp-permuter](https://github.com/simonlindholm/decomp-permuter), but for C++ and written
-in C++.
+[gta2_re](https://github.com/CriminalRETeam/gta2_re) (MSVC 6).
+
+cpp_permuter is heavily inspired by Simon Lindholm's
+[decomp-permuter](https://github.com/simonlindholm/decomp-permuter), which does the same for
+C. It borrows decomp-permuter's design wholesale: random and exhaustive search,
+weighted randomization passes, `PERM_*` macros, an objdump-based scorer, and outputs with a
+score and a diff. It is a separate implementation, written in C++, for C++ code compiled by
+MSVC. Like decomp-permuter, it is released under the [MIT license](LICENSE).
 
 How it works:
 

@@ -6,6 +6,7 @@
 #include "passes.hpp"
 #include "runner.hpp"
 #include "scorer.hpp"
+#include "macros.hpp"
 #include "workspace.hpp"
 
 #include <atomic>
@@ -63,8 +64,12 @@ Search:
       --max-candidates N    exhaustive: stop after N candidates (default 200000)
   -n, --iterations N        random: stop after N compiles (default: run until match/Ctrl-C)
       --max-mutations N     random: up to N passes/combos per candidate (default 3)
+      --keep-prob P         random: start from the best candidate so far with
+                            probability P, else from the base (default 0.5)
       --seed N              random seed
       --keep-going          don't stop at the first exact match
+      --weight NAME=N       random: how often a pass or combo (as written in -p) is
+                            picked, relative to the others; 0 never. Repeatable
   -j, --jobs N              parallel compiles (default 1)
       --timeout SEC         compile timeout (default 120)
 
@@ -85,11 +90,15 @@ Other functions (for helpers VC6 inlines into the target):
 
 Output:
   -o, --output-dir DIR      where improvements go (default: permuter_out)
+      --keep-ties           also write candidates that tie the best score
+      --only-if-below N     only write candidates scoring below N
+      --base-only           compile and score the unmodified function, then exit
       --config FILE         read "key = value" lines as if they were --key value
       --list-passes         list the passes and exit
       --show-ast            print the parsed statement tree and exit
       --dry-run             print the candidates' diffs instead of compiling
       --show-base-diff      print the asm diff of the unmodified function first
+      --show-timings        print where the time went: permuting, writing, compiling, scoring
   -v, --verbose             print compile errors
 
 Checking the parser:
@@ -97,6 +106,7 @@ Checking the parser:
                             it; report functions that don't parse and candidates
                             that don't parse back. Exit 1 on any
       --check-limit N       candidates checked per pass and function (default 25)
+      --list-definitions FILE...  print each function definition's byte range and name
 )";
 
 struct Options {
@@ -109,6 +119,10 @@ struct Options {
     long maxCandidates = 200000;
     long iterations = 0;
     int maxMutations = 3;
+    double keepProb = 0.5;
+    std::vector<std::string> weights; // NAME=N
+    bool keepTies = false, baseOnly = false;
+    long onlyBelow = -1;
     unsigned long long seed = 0;
     bool seedSet = false;
     bool keepGoing = false;
@@ -116,7 +130,7 @@ struct Options {
     int timeout = 120;
     std::string outputDir = "permuter_out";
     std::vector<std::string> also, includeDirs, checkParse;
-    bool inlineCallees = false, listRegions = false, checkMode = false;
+    bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false;
     int maxCallees = 8;
     long checkLimit = 25;
     std::string mirrorRoot;
@@ -174,6 +188,20 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "max-candidates") return num(o.maxCandidates);
     if (key == "iterations" || key == "n") return num(o.iterations);
     if (key == "max-mutations") return num(o.maxMutations);
+    if (key == "weight") return need() && (o.weights.push_back(val), true);
+    if (key == "keep-ties") return o.keepTies = true;
+    if (key == "base-only") return o.baseOnly = true;
+    if (key == "only-if-below") return num(o.onlyBelow);
+    if (key == "keep-prob") {
+        if (!need()) return false;
+        try {
+            o.keepProb = std::stod(val);
+        } catch (...) {
+            err = "--keep-prob: not a number: " + val;
+            return false;
+        }
+        return true;
+    }
     if (key == "seed") return num(o.seed) && (o.seedSet = true);
     if (key == "keep-going") return o.keepGoing = true;
     if (key == "jobs" || key == "j") return num(o.jobs);
@@ -185,6 +213,8 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
     if (key == "mirror-root") return need() && (o.mirrorRoot = val, true);
     if (key == "list-regions") return o.listRegions = true;
+    if (key == "show-timings") return o.showTimings = true;
+    if (key == "list-definitions") return o.listDefs = true;
     if (key == "check-parse") return o.checkMode = true;
     if (key == "check-limit") return num(o.checkLimit);
     if (key == "list-passes") return o.listPasses = true;
@@ -199,7 +229,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only",
     };
     return flags.count(k) > 0;
 }
@@ -333,6 +363,19 @@ double lastNumber(const std::string& s, bool& ok) {
 // One text per region; [0] is the target function.
 using Cand = std::vector<std::string>;
 
+// Where the time goes (--show-timings), in microseconds summed over workers.
+struct Timings {
+    std::atomic<long long> permute{0}, write{0}, compile{0}, score{0};
+    std::atomic<long> generated{0};
+} gTimes;
+
+struct Stopwatch {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    long long us() const {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
 size_t hashCand(const Cand& c) {
     std::string all;
     for (auto& t : c) all += t + '\x01';
@@ -342,6 +385,8 @@ size_t hashCand(const Cand& c) {
 struct Workspace {
     std::vector<Region> regions;
     Cand base;
+    std::shared_ptr<MacroExpander> macro; // PERM_* macros in the target function
+    bool passesOn = true;                 // false: only the macros are expanded
     std::map<std::string, std::string> files; // original contents of the files with regions
     std::string root;
 
@@ -365,6 +410,10 @@ struct Evaluator {
     std::string symbol, targetSymbol;
     std::vector<Insn> target;
     std::vector<Mirror> mirrors; // one per worker
+    // What each worker's mirror holds now: files are only rewritten when their
+    // content changes, so unchanged headers keep their timestamps and the
+    // compiler's precompiled header stays valid.
+    mutable std::vector<std::map<std::string, std::string>> written;
 
     std::string srcPath(int w) const { return mirrors[w].map(ws.regions[0].file); }
     std::string objPath(int w) const {
@@ -372,21 +421,29 @@ struct Evaluator {
     }
 
     bool compile(int w, const Cand& c, std::string& log) const {
+        Stopwatch sw;
         for (auto& [file, text] : ws.render(c)) {
+            auto it = written[w].find(file);
+            if (it != written[w].end() && it->second == text) continue;
             std::string path = mirrors[w].map(file);
             if (!writeFile(path, text)) {
                 log = "can't write " + path;
+                written[w].erase(file);
                 return false;
             }
+            written[w][file] = text;
         }
         std::string src = srcPath(w), obj = objPath(w);
         std::error_code ec;
         fs::remove(obj, ec);
+        gTimes.write += sw.us();
+        Stopwatch cw;
         std::string cmd = expandTemplate(o.compile, {{"src", src},
                                                      {"obj", obj},
                                                      {"dir", fs::path(src).parent_path().string()},
                                                      {"root", mirrors[w].dir()}});
         CmdResult r = runCommand(cmd, o.timeout);
+        gTimes.compile += cw.us();
         log = r.output;
         if (r.timedOut) log += "\n(timed out)";
         return r.status == 0 && fs::exists(obj);
@@ -394,6 +451,11 @@ struct Evaluator {
 
     // Score of a compiled candidate; -1 if it couldn't be scored.
     long score(int w, std::vector<Insn>* insns, std::string& log) const {
+        Stopwatch sw;
+        struct Add {
+            Stopwatch& sw;
+            ~Add() { gTimes.score += sw.us(); }
+        } add{sw};
         std::string obj = objPath(w);
         if (!o.scoreCmd.empty()) {
             CmdResult r = runCommand(expandTemplate(o.scoreCmd, {{"obj", obj}, {"src", srcPath(w)}}), o.timeout);
@@ -423,7 +485,7 @@ struct State {
     long baseScore = 0, bestScore = 0;
     long compiles = 0, failures = 0, improvements = 0;
     std::unordered_set<size_t> seen;
-    int outputs = 0;
+    int outputs = 0, ties = 0;
 };
 
 // Diff of every region that changed, with a header per region when there are several.
@@ -460,7 +522,8 @@ void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c
     writeFile(dir + "/diff.txt", diff);
     if (!insns.empty()) writeFile(dir + "/asm_diff.txt", diffInsns(ev.sc, ev.target, insns));
     writeFile(dir + "/score.txt", std::to_string(score) + "\n");
-    std::cout << "\n[" << score << "] new best (was " << st.bestScore << "), written to " << dir
+    std::cout << "\n[" << score << "] " << (score < st.bestScore ? "new best (was " + std::to_string(st.bestScore) + ")" : std::string("tie"))
+              << ", written to " << dir
               << "\n"
               << diff << std::flush;
 }
@@ -475,11 +538,15 @@ bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, lon
         if (o.verbose) std::cout << "\ncandidate failed:\n" << log << "\n";
         return false;
     }
+    bool wanted = o.onlyBelow < 0 || score < o.onlyBelow;
     if (score < st.bestScore) {
-        writeOutput(o, ev, st, c, score, insns);
+        if (wanted) writeOutput(o, ev, st, c, score, insns);
         st.bestScore = score;
         st.best = c;
         st.improvements++;
+    } else if (o.keepTies && score == st.bestScore && score < st.baseScore && wanted && st.ties < 200) {
+        st.ties++;
+        writeOutput(o, ev, st, c, score, insns);
     }
     return score == 0 && !o.keepGoing;
 }
@@ -497,6 +564,7 @@ Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, con
                      Rng& rng) {
     int total = 0;
     for (auto& g : groups) total += g.weight();
+    if (total <= 0) return {};
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
     Cand c = start;
     for (int m = 0; m < k; ++m) {
@@ -523,6 +591,64 @@ Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, con
     return c == start ? Cand{} : c;
 }
 
+void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+                   const std::function<bool(const Cand&, const std::string&)>& emit);
+
+bool hasMacros(const Workspace& ws) { return ws.macro && ws.macro->hasMacros(); }
+
+// One random candidate: from the best so far (with --keep-prob) or from the
+// base with a fresh random expansion of the PERM macros, plus random passes.
+// Empty if nothing changed.
+Cand nextRandom(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups,
+                const Cand& best, Rng& rng) {
+    std::uniform_real_distribution<double> coin(0, 1);
+    Cand start = ws.base;
+    if (ws.passesOn && best != ws.base && coin(rng) < o.keepProb) {
+        start = best;
+    } else if (hasMacros(ws)) {
+        start[0] = ws.macro->expand([&](int n) { return std::uniform_int_distribution<int>(0, n - 1)(rng); });
+        // a third of the time, the expansion on its own
+        if (!ws.passesOn || (start != ws.base && coin(rng) < 1.0 / 3)) return start == ws.base ? Cand{} : start;
+    }
+    Cand c = randomCandidate(o, groups, start, rng);
+    if (c.empty() && start != ws.base) return start;
+    return c;
+}
+
+// Every candidate of exhaustive mode, in order: each expansion of the PERM
+// macros, then (when the passes are on) up to --depth passes or combos applied
+// on top. emit returns 0 to stop, 1 for a new candidate, 2 for a repeat.
+void exhaustiveCands(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups,
+                     const std::function<int(const Cand&, const std::string&)>& emit) {
+    std::vector<Cand> level;
+    bool stop = false;
+    if (hasMacros(ws)) {
+        ws.macro->enumerate((size_t)o.maxCandidates, [&](const std::string& text) {
+            Cand c = ws.base;
+            c[0] = text;
+            level.push_back(c);
+            if (c != ws.base && emit(c, "PERM macros") == 0) stop = true;
+            return !stop;
+        });
+    } else {
+        level.push_back(ws.base);
+    }
+    if (!ws.passesOn) return;
+    for (int d = 1; d <= o.depth && !stop; ++d) {
+        std::vector<Cand> next;
+        for (auto& c : level) {
+            if (stop) break;
+            enumerateCand(groups, c, [&](const Cand& n, const std::string& g) {
+                int r = emit(n, g);
+                if (r == 0) stop = true;
+                if (r == 1 && d < o.depth) next.push_back(n);
+                return !stop;
+            });
+        }
+        level = std::move(next);
+    }
+}
+
 int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
     unsigned long long seed = o.seedSet ? o.seed : (unsigned long long)std::random_device{}();
     std::vector<std::thread> workers;
@@ -532,14 +658,16 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
             Rng rng(seed + (unsigned long long)w * 7919);
             int misses = 0;
             while (!gStop) {
-                Cand start;
+                Cand best;
                 {
                     std::lock_guard<std::mutex> lk(st.mu);
                     if (o.iterations && st.compiles >= o.iterations) break;
-                    bool fromBest = st.best != st.base && std::uniform_int_distribution<int>(0, 1)(rng) == 0;
-                    start = fromBest ? st.best : st.base;
+                    best = st.best;
                 }
-                Cand cand = randomCandidate(o, groups, start, rng);
+                Stopwatch gen;
+                Cand cand = nextRandom(o, ev.ws, groups, best, rng);
+                gTimes.permute += gen.us();
+                gTimes.generated++;
                 bool fresh = false;
                 if (!cand.empty()) {
                     std::lock_guard<std::mutex> lk(st.mu);
@@ -614,28 +742,25 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
     for (int w = 0; w < o.jobs; ++w) workers.emplace_back(worker, w);
 
     std::thread producer([&]() {
-        std::vector<Cand> level = {st.base};
-        for (int d = 1; d <= o.depth && !gStop; ++d) {
-            std::vector<Cand> next;
-            for (auto& c : level) {
-                if (gStop || produced >= o.maxCandidates) break;
-                enumerateCand(groups, c, [&](const Cand& n, const std::string&) {
-                    if (gStop || produced >= o.maxCandidates) return false;
-                    {
-                        std::lock_guard<std::mutex> lk(st.mu);
-                        if (!st.seen.insert(hashCand(n)).second) return true;
-                    }
-                    produced++;
-                    if (d < o.depth) next.push_back(n);
-                    std::unique_lock<std::mutex> lk(qmu);
-                    qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
-                    queue.push_back(n);
-                    qcv.notify_all();
-                    return true;
-                });
+        Stopwatch gen;
+        long long waited = 0;
+        exhaustiveCands(o, ev.ws, groups, [&](const Cand& n, const std::string&) {
+            gTimes.generated++;
+            if (gStop || produced >= o.maxCandidates) return 0;
+            {
+                std::lock_guard<std::mutex> lk(st.mu);
+                if (!st.seen.insert(hashCand(n)).second) return 2;
             }
-            level = std::move(next);
-        }
+            produced++;
+            Stopwatch wait;
+            std::unique_lock<std::mutex> lk(qmu);
+            qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
+            queue.push_back(n);
+            qcv.notify_all();
+            waited += wait.us();
+            return 1;
+        });
+        gTimes.permute += gen.us() - waited;
         std::lock_guard<std::mutex> lk(qmu);
         done = true;
         qcv.notify_all();
@@ -670,20 +795,20 @@ int dryRun(const Options& o, const Workspace& ws, const std::vector<PassGroup>& 
         long count = 0;
         std::unordered_set<size_t> seen = {hashCand(ws.base)};
         std::map<std::string, long> perGroup;
-        enumerateCand(groups, ws.base, [&](const Cand& c, const std::string& g) {
-            if (!seen.insert(hashCand(c)).second) return true;
+        exhaustiveCands(o, ws, groups, [&](const Cand& c, const std::string& g) {
+            if (!seen.insert(hashCand(c)).second) return 2;
             perGroup[g]++;
             if (++count <= 50) std::cout << "=== " << g << " #" << perGroup[g] << "\n" << candDiff(ws, c);
-            return count < o.maxCandidates;
+            return count < o.maxCandidates ? 1 : 0;
         });
-        for (auto& g : groups) std::cerr << g.name() << ": " << perGroup[g.name()] << " candidates\n";
+        for (auto& [g, n] : perGroup) std::cerr << g << ": " << n << " candidates\n";
         std::cerr << count << " candidates in total\n";
         return 0;
     }
     Rng rng(o.seedSet ? o.seed : 1);
     long n = o.iterations ? o.iterations : 10;
     for (long i = 0; i < n; ++i) {
-        Cand c = randomCandidate(o, groups, ws.base, rng);
+        Cand c = nextRandom(o, ws, groups, ws.base, rng);
         std::cout << "=== random #" << i + 1 << "\n" << (c.empty() ? "(no change)\n" : candDiff(ws, c));
     }
     return 0;
@@ -797,6 +922,17 @@ int main(int argc, char** argv) {
         for (auto& p : allPasses()) std::cout << "  " << p.name << "\n      " << p.description << "\n";
         return 0;
     }
+    if (o.listDefs) {
+        for (auto& path : o.checkParse) {
+            std::string text;
+            if (!readFile(path, text)) {
+                std::cerr << "error: can't read " << path << "\n";
+                return 1;
+            }
+            for (auto& d : listDefinitions(text)) std::cout << d.start << " " << d.end << " " << d.name << "\n";
+        }
+        return 0;
+    }
     if (o.checkMode) {
         if (o.checkParse.empty()) {
             std::cerr << "error: --check-parse needs files\n";
@@ -844,6 +980,23 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << err << "\n";
         return 2;
     }
+    for (auto& w : o.weights) {
+        size_t eq = w.find('=');
+        bool found = false;
+        if (eq != std::string::npos)
+            for (auto& g : groups)
+                if (g.name() == w.substr(0, eq)) {
+                    try {
+                        g.weightOverride = std::stoi(w.substr(eq + 1));
+                        found = true;
+                    } catch (...) {
+                    }
+                }
+        if (!found) {
+            std::cerr << "error: --weight " << w << ": expected NAME=N with NAME one of the -p passes/combos\n";
+            return 2;
+        }
+    }
     if (o.mode != "random" && o.mode != "exhaustive") {
         std::cerr << "error: --mode must be random or exhaustive\n";
         return 2;
@@ -877,6 +1030,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string text = ws.files[r.file].substr(r.start, r.end - r.start);
+        if (ws.base.empty()) {
+            ws.macro = std::make_shared<MacroExpander>(text);
+            if (!ws.macro->error().empty()) {
+                std::cerr << "error: " << r.name << ": " << ws.macro->error() << "\n";
+                return 1;
+            }
+            if (ws.macro->hasMacros()) {
+                text = ws.macro->first();
+                // like decomp-permuter: macros alone, unless PERM_RANDOMIZE or -p
+                ws.passesOn = ws.macro->randomize() || !o.passes.empty();
+            }
+        } else if (MacroExpander(text).hasMacros()) {
+            std::cerr << "error: " << r.name << ": PERM macros are only supported in the target function\n";
+            return 1;
+        }
+        if (groups.empty()) ws.passesOn = false;
         if (!parseFunc(text, err)) {
             std::cerr << "error: can't parse " << r.name << ": " << err << "\n";
             return 1;
@@ -909,6 +1078,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ev.mirrors.push_back(m);
+        ev.written.push_back(ws.files); // the mirror starts with copies of the originals
     }
 
     std::signal(SIGINT, onSignal);
@@ -955,6 +1125,10 @@ int main(int argc, char** argv) {
     }
     if (o.showBaseDiff && !baseInsns.empty()) std::cout << diffInsns(ev.sc, ev.target, baseInsns);
     std::cout << "base score: " << base << "\n";
+    if (o.baseOnly) {
+        cleanup();
+        return base == 0 ? 0 : 3;
+    }
 
     State st;
     st.base = st.best = ws.base;
@@ -974,5 +1148,15 @@ int main(int argc, char** argv) {
     else if (st.bestScore < base) std::cout << "best score " << st.bestScore << " (base " << base << ")";
     else std::cout << "no improvement over base score " << base;
     std::cout << " after " << st.compiles << " compiles (" << st.failures << " failed)\n";
+    if (o.showTimings) {
+        long n = std::max<long>(1, st.compiles);
+        auto ms = [](long long us) { return std::to_string(us / 1000) + " ms"; };
+        std::cout << "timings (summed over " << o.jobs << " workers):\n"
+                  << "  permute: " << ms(gTimes.permute) << " for " << gTimes.generated
+                  << " candidates generated\n"
+                  << "  write:   " << ms(gTimes.write) << " (" << ms(gTimes.write / n) << " per compile)\n"
+                  << "  compile: " << ms(gTimes.compile) << " (" << ms(gTimes.compile / n) << " per compile)\n"
+                  << "  score:   " << ms(gTimes.score) << " (" << ms(gTimes.score / n) << " per compile)\n";
+    }
     return st.bestScore == 0 ? 0 : 3;
 }

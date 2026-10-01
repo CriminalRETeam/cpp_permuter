@@ -150,8 +150,10 @@ run inline_callee Score also -m exhaustive -p swap_operands --also Weight
 expect_exact_source
 run inline_callee Score also-file -m exhaustive -p swap_operands --also helper.hpp:Weight
 expect_exact_source
+# random runs can reach an equivalent helper ("4 * x + y" compiles the same at
+# -O0), so this one only needs a match
 run inline_callee Score random -m random -p swap_operands,flip_compare --inline-callees -n 100
-expect_exact_source
+expect_match
 run inline_callee Score control -m exhaustive
 expect_no_match
 

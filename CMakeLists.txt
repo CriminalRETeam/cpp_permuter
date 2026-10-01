@@ -18,6 +18,7 @@ add_library(permuter_core STATIC
     src/scorer.cpp
     src/runner.cpp
     src/workspace.cpp
+    src/macros.cpp
 )
 target_include_directories(permuter_core PUBLIC src)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

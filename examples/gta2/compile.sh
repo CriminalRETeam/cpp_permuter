@@ -26,9 +26,24 @@ export WINEPATH="$(winpath "$TOOLS/VC98/Bin");$(winpath "$TOOLS/Common/MSDev98/B
 export INCLUDE="$(winpath "$TOOLS/VC98/ATL/Include");$(winpath "$TOOLS/VC98/Include");$(winpath "$TOOLS/VC98/MFC/Include")"
 export LIB="$(winpath "$TOOLS/VC98/Lib")"
 
+FLAGS="/DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /D_CRT_NON_CONFORMING_SWPRINTFS /DIMGUI_DLL \
+    /W3 /EHsc /GX /ML /O2 /DNDEBUG $EXTRA_CFLAGS"
+INCS="/I$(winpath "$(dirname "$SRC")") /I$(winpath "$GTA2_RE") /I$(winpath "$TOOLS")"
+
+# Precompiled headers (/YX, one .pch next to each object, so per permuter
+# worker) halve the compile time. VC6 rebuilds the .pch when a header it holds
+# changes, and the code is the same as without it (checked on every function of
+# PedGroup.cpp). /Zm500 instead of /Zm1000: with /YX, /Zm1000 runs out of heap
+# space under wine. NO_PCH=1 turns it off; if VC6 can't use the .pch the file is
+# compiled again without it.
+#
 # cl.exe exits 0 on warnings and 2 on errors; its output goes to stdout.
-wine cl.exe /nologo /TP /c \
-    /I"$(winpath "$(dirname "$SRC")")" /I"$(winpath "$GTA2_RE")" /I"$(winpath "$TOOLS")" \
-    /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /D_CRT_NON_CONFORMING_SWPRINTFS /DIMGUI_DLL \
-    /W3 /Zm1000 /EHsc /GX /ML /O2 /DNDEBUG $EXTRA_CFLAGS \
-    /Fo"$(winpath "$OBJ")" "$(winpath "$SRC")"
+if [ -z "${NO_PCH:-}" ]; then
+    LOG=$(wine cl.exe /nologo /TP /c $INCS $FLAGS /Zm500 /YX /Fp"$(winpath "${OBJ%.*}.pch")" \
+        /Fo"$(winpath "$OBJ")" "$(winpath "$SRC")") && { printf '%s\n' "$LOG"; exit 0; }
+    if ! printf '%s' "$LOG" | grep -q -E "C1060|C1076|C1083|C1852|C1853|C1859|C2859"; then
+        printf '%s\n' "$LOG"
+        exit 2
+    fi
+fi
+wine cl.exe /nologo /TP /c $INCS $FLAGS /Zm1000 /Fo"$(winpath "$OBJ")" "$(winpath "$SRC")"

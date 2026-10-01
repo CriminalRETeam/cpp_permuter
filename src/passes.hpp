@@ -33,13 +33,14 @@ bool randomMutation(const Pass& p, const Func& f, Rng& rng, std::string& out);
 // A pass, or a combination of passes written "a+b+c" on the command line.
 struct PassGroup {
     std::vector<const Pass*> passes;
+    int weightOverride = -1; // --weight
     std::string name() const;
     int weight() const;
 };
 
 // Parses pass specs such as {"reorder_saves,invert_if", "swap_operands+flip_compare"}:
 // commas separate groups, '+' combines passes into one group, "all" adds every
-// pass as its own group. No specs means "all".
+// pass as its own group, "none" adds nothing (no passes). No specs means "all".
 bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup>& out,
                     std::string& err);
 
