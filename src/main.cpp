@@ -2,6 +2,7 @@
 // its compiled code matches (or gets closer to) a target object.
 
 #include "analysis.hpp"
+#include "examples.hpp"
 #include "parser.hpp"
 #include "passes.hpp"
 #include "runner.hpp"
@@ -95,6 +96,7 @@ Output:
       --base-only           compile and score the unmodified function, then exit
       --config FILE         read "key = value" lines as if they were --key value
       --list-passes         list the passes and exit
+      --pass-examples       print an example of every pass (docs/passes.md) and exit
       --show-ast            print the parsed statement tree and exit
       --dry-run             print the candidates' diffs instead of compiling
       --show-base-diff      print the asm diff of the unmodified function first
@@ -130,7 +132,8 @@ struct Options {
     int timeout = 120;
     std::string outputDir = "permuter_out";
     std::vector<std::string> also, includeDirs, checkParse;
-    bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false;
+    bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
+         passExamples = false;
     int maxCallees = 8;
     long checkLimit = 25;
     std::string mirrorRoot;
@@ -215,6 +218,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "list-regions") return o.listRegions = true;
     if (key == "show-timings") return o.showTimings = true;
     if (key == "list-definitions") return o.listDefs = true;
+    if (key == "pass-examples") return o.passExamples = true;
     if (key == "check-parse") return o.checkMode = true;
     if (key == "check-limit") return num(o.checkLimit);
     if (key == "list-passes") return o.listPasses = true;
@@ -229,7 +233,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples",
     };
     return flags.count(k) > 0;
 }
@@ -925,6 +929,10 @@ int main(int argc, char** argv) {
     }
     if (o.listPasses) {
         for (auto& p : allPasses()) std::cout << "  " << p.name << "\n      " << p.description << "\n";
+        return 0;
+    }
+    if (o.passExamples) {
+        std::cout << passExamplesMarkdown();
         return 0;
     }
     if (o.listDefs) {

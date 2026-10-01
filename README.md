@@ -1,5 +1,7 @@
 # cpp_permuter
 
+[![CI](https://github.com/CriminalRETeam/cpp_permuter/actions/workflows/ci.yml/badge.svg)](https://github.com/CriminalRETeam/cpp_permuter/actions/workflows/ci.yml)
+
 Brute-forces source permutations of a single C++ function until its compiled code matches a
 target object, or gets closer to it. It is built for matching decompilation projects such as
 [gta2_re](https://github.com/CriminalRETeam/gta2_re) (MSVC 6).
@@ -25,7 +27,12 @@ How it works:
 
 ## Building
 
-Needs CMake 3.16+ and a C++17 compiler. Scoring also needs `llvm-objdump` on `PATH`.
+Needs CMake 3.16+ and a C++17 compiler: GCC or clang on Linux, MSVC (or MinGW) on Windows.
+Scoring also needs `llvm-objdump` on `PATH`. On Windows it comes with the LLVM installer.
+
+Windows runs natively. Commands go through `cmd.exe`, so use `examples/gta2/compile.cmd`
+there. Where symlinks aren't allowed (no Developer Mode), the mirror uses hard links or
+copies instead. CI builds and tests on Linux and Windows.
 
 ```sh
 cmake -S . -B build -G Ninja      # or leave out -G for make
@@ -60,6 +67,14 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--show-base-diff` | print the target/base asm alignment before starting |
 | `--config FILE` | `key = value` lines, same keys as the long options. Handy for one config per function |
 | `--keep-going` | keep searching after an exact match |
+| `--keep-prob P` | random: start from the best candidate so far with probability P, else from the base (default 0.5) |
+| `--weight NAME=N` | random: how often a pass or combo (as written in `-p`) is picked; `0` never |
+| `--keep-ties` | also write candidates that tie the best score (different ways to the same code) |
+| `--only-if-below N` | only write candidates scoring below N |
+| `--base-only` | compile and score the unmodified function, print the score, exit |
+| `--show-timings` | where the time went: permuting, writing, compiling, scoring |
+| `-p none` | no passes: only the `PERM_*` macros (see below) |
+| `-I DIR` | where to find headers for `--inline-callees`/`--also`, besides each file's own directory. The compiler's include paths stay in your compile command |
 | `--inline-callees`, `--also [FILE:]NAME` | also permute inline helpers the function calls, see below |
 | `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
 
@@ -107,6 +122,42 @@ function, and exhaustive mode tries every pass on every function. Only the targe
 is scored. When a candidate matches, the output has the changed headers next to
 `source.cpp`.
 
+## PERM macros
+
+When you already know the alternatives, write them into the function, as with decomp-permuter:
+
+```cpp
+void PedGroup::f(u8 idx)
+{
+    PERM_LINESWAP(
+    Weapon_30* a = field_2C_ped_leader->field_170_selected_weapon;
+    Weapon_30* b = field_4_ped_list[idx]->field_170_selected_weapon;
+    )
+    field_23C = PERM_GENERAL(99, 100);
+    if (PERM_GENERAL(x == 0, !x)) g();
+}
+```
+
+| macro | expands to |
+|---|---|
+| `PERM_GENERAL(a, b, ...)` | one of `a`, `b`, ... |
+| `PERM_LINESWAP(lines)` | the non-blank lines in any order |
+| `PERM_INT(lo, hi)` | an integer from `lo` to `hi` |
+| `PERM_ONCE([key,] code)` | `code` at exactly one of the places that use `key` |
+| `PERM_VAR(a, b)`, `PERM_VAR(a)` | set, and read, the meta-variable `a` |
+| `PERM_RANDOMIZE(code)` | `code`, and turns the passes on |
+| `PERM_FORCE_SAMELINE(code)` | `code` on one line |
+| `PERM_IGNORE(code)` | `code`, with no macros expanded inside |
+| `PERM_PRETEND(code)` | nothing |
+
+Arguments split at top-level commas, and `(,)` is a literal comma. Macros can be nested.
+
+Exhaustive mode tries every expansion, and random mode picks one at random. As in
+decomp-permuter, a function with macros is only permuted through them, unless it uses
+`PERM_RANDOMIZE` or you pass `-p`. In that case the passes run on top of each expansion, over
+the whole function (not just inside the `PERM_RANDOMIZE` region). Macros are supported in
+the target function only.
+
 ## Combining passes
 
 A function is often off in more than one way: the saves are in the wrong order *and* an `if`
@@ -126,7 +177,9 @@ above, plus each pass applied twice.
 
 ## Passes
 
-`cpp_permuter --list-passes` prints these:
+`cpp_permuter --list-passes` prints these. **[docs/passes.md](docs/passes.md) shows each one
+on an example function**, generated from the passes themselves
+(`cpp_permuter --pass-examples`).
 
 | pass | what it does |
 |---|---|
@@ -151,6 +204,21 @@ above, plus each pass applied twice.
 | `negate_const` | `x - 4` and `x + -4`, `x -= 4` and `x += -4` (the `sub` vs `add -N` quirk) |
 | `loop_form` | `for (i; c; s) B` and `i; while (c) { B s; }`, `while (c)` and `for (; c;)` |
 | `reassociate` | `a + b + c` and `a + (b + c)`, for `+ * & \| ^` |
+| `inequalities` | `x > 4` and `x >= 5`, `x < 4` and `x <= 3`, for integer constants (VC6 picks the `cmp` constant and jump from it) |
+| `chain_assign` | `a = v; b = v;` and `a = b = v;` (or `b = v; a = b;`), which decides the register that holds `v` |
+| `scope_block` | Wrap a declaration and the statements using it in a `{ }` block, or take a nested block apart (VC6 shares stack slots between blocks) |
+| `local_type` | Change a local's integer type: `s32`, `u32`, `s16`, `u16`, `s8`, `u8` (or `int`/`unsigned`/`short`/`char`..., or `DWORD`/`WORD`/`BYTE`...) |
+| `locals_to_array` | Consecutive locals of one type become one array, in order or back to front (stack slot order) |
+| `reorder_cases` | Reorder a switch's case groups (case bodies are laid out in source order). A last group without `break` gets one when it moves |
+| `split_case_labels` | `case 1: case 2: S` and `case 1: S case 2: S`, both ways (one jump table entry per case vs a byte index table) |
+| `use_getter` | `p->field_1AC_cam.x` and `p->get_cam_x()`, both ways, using the inline getters found in the source and the headers it includes |
+| `temp_for_expr` | Compute a cast, a local or `*p` into a new local first (`u8 tmp = (u8)p->a; g(tmp);`). Types come from the declarations; also "copy through a local to get a spill" |
+| `remove_stmt` | Remove an expression statement (low weight) |
+
+decomp-permuter passes left out because they rely on IDO behaviour that VC6 `/O2` folds
+away: `perm_xor_zero`, `perm_mult_zero`, `perm_add_mask`, `perm_dummy_comma_expr`,
+`perm_factor_mult`/`shift`, `perm_float_literal`, `perm_sameline`, `perm_pad_var_decl`,
+`perm_add_self_assignment` and `perm_duplicate_assignment`.
 
 The passes aim to keep behaviour the same, but they don't prove it. For example they assume
 that two different fields don't alias. That is fine here, because a candidate that matches the
@@ -177,6 +245,32 @@ On gta2_re (`--check-parse Source/*.cpp Source/*.hpp`):
 - 4 statements stay barriers (a `typedef`, two `using namespace`, a local `struct`);
 - every candidate that every pass produces parses back.
 
+## Speed
+
+`--show-timings` on VC6 under wine, `PedGroup.cpp`, 4 workers:
+
+| stage | per candidate |
+|---|---|
+| permute (parse, mutate, splice) | 0.5 ms |
+| write the mirror files | 1 ms |
+| compile | 600 ms; 355 ms with precompiled headers |
+| score (`llvm-objdump` plus diff) | 32 ms |
+
+The permuter keeps the original file and each function's byte range. A mutation only
+re-lexes the function, and each candidate is spliced into in-memory copies, so practically
+all the time is spent in the compiler.
+
+`examples/gta2/compile.sh` and `compile.cmd` use VC6 precompiled headers (`/YX`, one `.pch`
+per worker), which halves the compile time. The code is identical to a normal compile for
+every function in `PedGroup.cpp`. The mirror only rewrites files whose content changed, so
+the `.pch` stays valid. While headers are being permuted, the permuter sets
+`PERMUTER_NO_PCH=1`: VC6 checks the `.pch` by timestamp, and missed header edits made within
+the same second.
+
+Stripping the other functions out of the file (decomp-permuter's `strip_other_fns.py`)
+would only save another 10%, and it changed the code of 1 of PedGroup's 38 functions, so it
+isn't offered.
+
 ## Scoring
 
 The function is disassembled with `llvm-objdump -d -r --disassemble-symbols=<sym>`. Before
@@ -193,13 +287,16 @@ or a deletion. The weights are the same idea as decomp-permuter's.
 
 ## Tests
 
-`ctest --test-dir build` runs four suites.
+`ctest --test-dir build` runs four suites. CI runs `unit` and `integration` on Linux and
+Windows.
 
 `unit` (`tests/tests.cpp`) covers:
 
 - the lexer and the parser, including listing every definition in a file;
 - the effects analysis;
 - every pass, in both directions where it has two;
+- the `PERM_*` macro expander;
+- that `docs/passes.md` is what the passes produce today;
 - pass combos;
 - the scorer;
 - finding inline callees;
@@ -218,13 +315,17 @@ shows the match comes from that pass. The cases are:
 - `inline_local`: a local the original didn't have.
 - `ops`: swapped operands.
 - One case for each of `bool_return`, `ternary_arg`, `switch_if`, `branch_dup`, `cond_split`,
-  `negate_const` and `reassociate`.
+  `negate_const`, `reassociate`, `inequalities`, `chain_assign`, `local_type`,
+  `locals_to_array`, `reorder_cases`, `split_case_labels`, `use_getter`, `temp_for_expr` and
+  `remove_stmt`.
+- `perm_macros`: `PERM_LINESWAP` and `PERM_GENERAL`. All 17 expansions are tried, and
+  without the macros (`-p none`) there's no match.
 - `inline_callee`: the function is right, but the `__forceinline` helper in its header isn't.
   It is found by `--inline-callees`, `--also NAME` and `--also FILE:NAME`. Without them there
   is no match.
 
-`early_return`, `explicit_compare` and `loop_form` compile identically at clang `-O0`, so only
-the unit tests cover them.
+`early_return`, `explicit_compare`, `loop_form` and `scope_block` compile identically at
+clang `-O0`, so only the unit tests cover them.
 
 `gta2_parse` (`tests/integration/gta2_parse.sh`) runs `--check-parse` over every gta2_re
 source and header. It fails if any of these happen:
@@ -248,8 +349,21 @@ source. A control without the needed pass must not match. It works in a symlinke
 - `Fix16::Max` with its comparison mirrored, and `Fix16::Abs` written as a ternary, in
   `fix16.hpp`, as inlined into `PedGroup` functions. They are recovered through
   `--inline-callees` and `--also`; permuting only the calling function doesn't match.
+- `PedGroup::IsLeaderCloseToTargetCar_4CAD40`: `use_getter`, with `get_cam_y()` written
+  out as the field it reads. Two sources match here: the original, and one that reads the
+  car's x through `Car_BC::get_x_41E430()` instead. VC6 compiles both to the same code.
+- `PedGroup::sub_4C9150`: `inequalities` (`< 0x28` written as `<= 0x27`).
+- `PERM_LINESWAP` around the scrambled weapon saves.
 - 60 random candidates from every pass on `RemovePed`: at most 10% may fail to compile.
   None did.
+
+Some rewrites turned out to make no difference to VC6, so they have no VC6 case:
+
+- inverting `Fix16::Abs`'s `if`, and its early-return form;
+- reordering the cases of the switches tried;
+- `u8` instead of `s32` for a loop counter.
+
+Clang at `-O0` covers those passes instead.
 
 `gta2_parse` and `vc6` need `GTA2_RE` set to a gta2_re checkout, and `vc6` also needs wine.
 Without them they are reported as skipped.

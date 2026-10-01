@@ -20,6 +20,7 @@ add_library(permuter_core STATIC
     src/runner.cpp
     src/workspace.cpp
     src/macros.cpp
+    src/examples.cpp
 )
 target_include_directories(permuter_core PUBLIC src)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -32,6 +33,7 @@ target_link_libraries(cpp_permuter PRIVATE permuter_core Threads::Threads)
 enable_testing()
 add_executable(permuter_tests tests/tests.cpp)
 target_link_libraries(permuter_tests PRIVATE permuter_core Threads::Threads)
+target_compile_definitions(permuter_tests PRIVATE PERMUTER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME unit COMMAND permuter_tests)
 # integration: clang stand-in, runs anywhere clang and llvm-objdump are
 # installed. gta2_parse and vc6 need GTA2_RE (and wine for vc6). Exit code 77

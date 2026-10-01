@@ -1,6 +1,7 @@
 // Unit tests. No framework: each CHECK prints the failing line.
 
 #include "analysis.hpp"
+#include "examples.hpp"
 #include "lexer.hpp"
 #include "macros.hpp"
 #include "parser.hpp"
@@ -11,8 +12,8 @@
 #include <filesystem>
 #include <fstream>
 
+#include <chrono>
 #include <iostream>
-#include <unistd.h>
 #include <set>
 
 using namespace perm;
@@ -513,7 +514,8 @@ int A::operator==(const A& o) { return 1; }
 
 static void testWorkspace() {
     namespace fs = std::filesystem;
-    fs::path dir = fs::temp_directory_path() / ("cpp_permuter_test_" + std::to_string(::getpid()));
+    fs::path dir = fs::temp_directory_path() /
+                   ("cpp_permuter_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::remove_all(dir);
     writeTo(dir / "src/main.cpp", "#include \"a.hpp\"\n#include <vector>\n\nint Main(P* p)\n{\n"
                                   "    return Weight(p->a) + Weight(p->a, 2) + Helper(p) + p->Get();\n}\n"
@@ -550,19 +552,27 @@ static void testWorkspace() {
     // it: the mirror must use the edited file the symlink tree holds, not
     // resolve back to where the other symlinks point
     fs::create_directories(dir / "links");
-    for (auto& entry : fs::directory_iterator(dir / "src"))
-        fs::create_symlink(entry.path(), dir / "links" / entry.path().filename());
+    std::error_code sec;
+    fs::create_symlink(dir / "src/main.cpp", dir / "probe_link", sec);
+    bool canSymlink = !sec; // Windows needs Developer Mode or admin rights
+    if (!canSymlink) std::cerr << "  (no symlinks here: checking the copy/hard-link mirror only)\n";
+    for (auto& entry : fs::directory_iterator(dir / "src")) {
+        if (canSymlink) fs::create_symlink(entry.path(), dir / "links" / entry.path().filename());
+        else fs::copy(entry.path(), dir / "links" / entry.path().filename(), fs::copy_options::recursive);
+    }
     fs::remove(dir / "links/a.hpp");
     writeTo(dir / "links/a.hpp", "// edited\n");
     Mirror m;
     CHECK(m.create((dir / "links").string(), (dir / "mirror").string(), {(dir / "links/main.cpp").string()}, err));
     CHECK(readFrom(m.map((dir / "links/a.hpp").string())) == "// edited\n");
     CHECK(!fs::is_symlink(m.map((dir / "links/main.cpp").string())));
-    CHECK(fs::is_symlink(dir / "mirror/sub"));
+    CHECK(!canSymlink || fs::is_symlink(dir / "mirror/sub"));
+    CHECK(fs::exists(dir / "mirror/sub/b.hpp"));
     // a changed file in a subdirectory turns that directory into a real one
     Mirror m2;
     CHECK(m2.create((dir / "src").string(), (dir / "mirror2").string(), {(dir / "src/sub/b.hpp").string()}, err));
     CHECK(!fs::is_symlink(dir / "mirror2/sub") && !fs::is_symlink(dir / "mirror2/sub/b.hpp"));
+    CHECK(readFrom(dir / "mirror2/sub/b.hpp") == readFrom(dir / "src/sub/b.hpp"));
     CHECK(!m2.create((dir / "src/sub").string(), (dir / "mirror3").string(), {(dir / "src/main.cpp").string()}, err));
     fs::remove_all(dir);
 }
@@ -684,7 +694,18 @@ static void testMacros() {
     }
 }
 
+static void testPassDocs() {
+    // docs/passes.md must be what --pass-examples prints now
+    std::string gen = passExamplesMarkdown();
+    std::string doc = readFrom(std::string(PERMUTER_SOURCE_DIR) + "/docs/passes.md");
+    CHECK(gen == doc);
+    if (gen != doc) std::cerr << "  regenerate: build/cpp_permuter --pass-examples > docs/passes.md\n";
+    CHECK(!contains(gen, "(no candidate"));
+    for (auto& p : allPasses()) CHECK(contains(gen, "## `" + p.name + "`"));
+}
+
 int main() {
+    testPassDocs();
     testInequalities();
     testChainAssign();
     testScopeBlock();

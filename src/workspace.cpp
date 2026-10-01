@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -218,11 +219,35 @@ bool Mirror::create(const std::string& root, const std::string& dir,
         err = "can't create " + dir_ + ": " + ec.message();
         return false;
     }
-    auto linkEntries = [&](const fs::path& from, const fs::path& to) {
+    // Each entry becomes a symlink. Where symlinks aren't allowed (Windows
+    // without Developer Mode) a directory is mirrored entry by entry and a
+    // file becomes a hard link, or a copy across volumes. The mirror never
+    // writes to these; files it changes are replaced by copies below.
+    std::function<bool(const fs::path&, const fs::path&)> linkEntries = [&](const fs::path& from,
+                                                                            const fs::path& to) {
         for (auto& e : fs::directory_iterator(from, ec)) {
-            fs::create_symlink(e.path(), to / e.path().filename(), ec);
-            if (ec) {
-                err = "can't symlink " + e.path().string() + ": " + ec.message();
+            fs::path dst = to / e.path().filename();
+            std::error_code lec;
+            bool dir = fs::is_directory(e.path(), lec);
+            if (dir) fs::create_directory_symlink(e.path(), dst, lec);
+            else fs::create_symlink(e.path(), dst, lec);
+            if (!lec) continue;
+            if (dir) {
+                fs::create_directory(dst, lec);
+                if (lec || !linkEntries(e.path(), dst)) {
+                    if (err.empty()) err = "can't mirror " + e.path().string() + ": " + lec.message();
+                    return false;
+                }
+                continue;
+            }
+            lec.clear();
+            fs::create_hard_link(e.path(), dst, lec);
+            if (lec) {
+                lec.clear();
+                fs::copy_file(e.path(), dst, lec);
+            }
+            if (lec) {
+                err = "can't mirror " + e.path().string() + ": " + lec.message();
                 return false;
             }
         }
