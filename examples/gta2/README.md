@@ -55,6 +55,11 @@ Suggestions:
 - When it's off in two ways at once, combine the passes: `-p reorder_saves+invert_if` tries
   each pass alone and every pair of their variants. `-p` can be repeated to run several
   combos in one go.
+- If the asm looks right apart from code that comes from an inline helper (a getter, a
+  `Fix16` operator, `Abs`/`Max`), add `--inline-callees`, or name the helper with `--also
+  fix16.hpp:Max`. The helper is permuted too. Check `--list-regions` to see which functions
+  were picked up. If a header change ends up in the match, it affects every TU that includes
+  that header, so run `compare_builds.py` before committing it.
 - `--dry-run` shows what a pass would produce without compiling anything.
 - Random mode (the default) mixes all passes and is good for leaving running. Add
   `-p reorder_saves,move_stmt` and similar to focus it.

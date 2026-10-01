@@ -101,12 +101,78 @@ std::vector<std::string> nameTokens(const std::string& qual) {
 
 } // namespace
 
-bool locateFunction(const std::string& src, const std::string& qualName, size_t& start,
-                    size_t& end, std::string& err) {
+namespace {
+
+// For a name whose parameter list opens at toks[open]: the '{' of its body if
+// this is a definition, else -1. Between ')' and '{' only qualifiers such as
+// const/throw(...) and a constructor's initializer list may appear, so macro
+// invocations like "MATCH_FUNC(0x1) void f() {" aren't mistaken for one.
+int definitionBody(const std::vector<Token>& toks, int open) {
+    int n = (int)toks.size();
+    int close = matchBracket(toks, open);
+    if (close < 0) return -1;
+    int j = close + 1;
+    bool initList = false;
+    while (j < n) {
+        const Token& tk = toks[j];
+        const std::string& t = tk.text;
+        if (tk.kind == TokKind::Punct) {
+            if (t == "{") {
+                // in an initializer list "m{...}" is a member init, not the body
+                if (initList && j > 0 && toks[j - 1].kind == TokKind::Ident &&
+                    toks[j - 1].text != "const") {
+                    j = matchBracket(toks, j);
+                    if (j < 0) return -1;
+                    j++;
+                    continue;
+                }
+                return j;
+            }
+            if (t == "(" || t == "[") {
+                if (!initList && !(j > 0 && (toks[j - 1].text == "throw" ||
+                                             toks[j - 1].text == "noexcept" ||
+                                             toks[j - 1].text == "__declspec")))
+                    return -1;
+                j = matchBracket(toks, j);
+                if (j < 0) return -1;
+                j++;
+                continue;
+            }
+            if (t == ":") {
+                initList = true;
+                j++;
+                continue;
+            }
+            if (initList && (t == "," || t == "::" || t == "<" || t == ">")) {
+                j++;
+                continue;
+            }
+            return -1;
+        }
+        if (tk.kind != TokKind::Ident) return -1;
+        if (!initList && t != "const" && t != "volatile" && t != "throw" && t != "noexcept" &&
+            t != "override" && t != "final" && t != "__declspec")
+            return -1;
+        j++;
+    }
+    return -1;
+}
+
+bool keywordCall(const std::string& s) {
+    return s == "if" || s == "while" || s == "for" || s == "switch" || s == "return" ||
+           s == "sizeof" || s == "catch" || s == "__except" || s == "defined" ||
+           s == "static_cast" || s == "reinterpret_cast" || s == "const_cast" ||
+           s == "dynamic_cast" || s == "throw" || s == "__declspec" || s == "operator";
+}
+
+} // namespace
+
+std::vector<std::pair<size_t, size_t>> findDefinitions(const std::string& src,
+                                                       const std::string& qualName) {
+    std::vector<std::pair<size_t, size_t>> out;
     std::vector<Token> toks = lex(src);
     std::vector<std::string> pat = nameTokens(qualName);
     int n = (int)toks.size();
-    int found = 0;
     for (int k = 0; k + (int)pat.size() < n; ++k) {
         bool ok = true;
         for (size_t p = 0; p < pat.size() && ok; ++p) ok = toks[k + p].text == pat[p];
@@ -117,46 +183,49 @@ bool locateFunction(const std::string& src, const std::string& qualName, size_t&
         int s = k;
         while (s >= 2 && toks[s - 1].text == "::" && toks[s - 2].kind == TokKind::Ident) s -= 2;
         if (s >= 1 && (toks[s - 1].text == "." || toks[s - 1].text == "->")) continue;
-        int close = matchBracket(toks, open);
-        if (close < 0) continue;
-        int j = close + 1, body = -1;
-        while (j < n) {
-            const std::string& t = toks[j].text;
-            if (toks[j].kind == TokKind::Punct) {
-                if (t == "{") {
-                    body = j;
-                    break;
-                }
-                if (t == "(" || t == "[") {
-                    j = matchBracket(toks, j);
-                    if (j < 0) break;
-                    j++;
-                    continue;
-                }
-                if (t == ":" || t == "," || t == "::" || t == "*" || t == "&" || t == "<" ||
-                    t == ">") {
-                    j++;
-                    continue;
-                }
-                break;
-            }
-            if (toks[j].kind != TokKind::Ident) break;
-            j++;
-        }
+        int body = definitionBody(toks, open);
         if (body < 0) continue;
         int bodyEnd = matchBracket(toks, body);
         if (bodyEnd < 0) continue;
-        if (found++ == 0) {
-            start = toks[s].offset;
-            end = toks[bodyEnd].offset + 1;
-        }
+        out.push_back({toks[s].offset, toks[bodyEnd].offset + 1});
     }
-    if (found == 0) {
+    return out;
+}
+
+std::vector<Definition> listDefinitions(const std::string& src) {
+    std::vector<Definition> out;
+    std::vector<Token> toks = lex(src);
+    int n = (int)toks.size();
+    for (int k = 0; k + 1 < n; ++k) {
+        if (toks[k].kind != TokKind::Ident || toks[k + 1].text != "(" || keywordCall(toks[k].text))
+            continue;
+        int s = k;
+        if (s >= 1 && toks[s - 1].text == "~") s--;
+        while (s >= 2 && toks[s - 1].text == "::" && toks[s - 2].kind == TokKind::Ident) s -= 2;
+        if (s >= 1 && (toks[s - 1].text == "." || toks[s - 1].text == "->")) continue;
+        int body = definitionBody(toks, k + 1);
+        if (body < 0) continue;
+        int bodyEnd = matchBracket(toks, body);
+        if (bodyEnd < 0) continue;
+        std::string name;
+        for (int i = s; i <= k; ++i) name += toks[i].text;
+        out.push_back({name, toks[s].offset, toks[bodyEnd].offset + 1});
+        k = bodyEnd; // nothing inside a body is a definition we want
+    }
+    return out;
+}
+
+bool locateFunction(const std::string& src, const std::string& qualName, size_t& start,
+                    size_t& end, std::string& err) {
+    auto defs = findDefinitions(src, qualName);
+    if (defs.empty()) {
         err = "definition of '" + qualName + "' not found";
         return false;
     }
-    if (found > 1)
-        err = "warning: " + std::to_string(found) + " definitions of '" + qualName +
+    start = defs[0].first;
+    end = defs[0].second;
+    if (defs.size() > 1)
+        err = "warning: " + std::to_string(defs.size()) + " definitions of '" + qualName +
               "' found, using the first";
     return true;
 }

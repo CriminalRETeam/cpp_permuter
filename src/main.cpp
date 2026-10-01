@@ -6,6 +6,7 @@
 #include "passes.hpp"
 #include "runner.hpp"
 #include "scorer.hpp"
+#include "workspace.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -32,11 +33,15 @@ const char* kUsage = R"(usage: cpp_permuter [options]
 
 Finds a source permutation of one function that compiles to the target code.
 
+  cpp_permuter -s FILE -f NAME -c CMD -t OBJ [options]
+  cpp_permuter --check-parse FILE... [--check-limit N]
+
 Required:
   -s, --source FILE         .cpp file holding the function
   -f, --function NAME       function to permute, e.g. PedGroup::PromoteMemberToLeader_4C9680
   -c, --compile CMD         compile command. {src} is the candidate source, {obj} the
-                            object to write, {dir} the original source's directory
+                            object to write, {dir} the candidate's directory and {root}
+                            the mirror of --mirror-root
   -t, --target-obj FILE     object file with the target code (not needed with --score-cmd)
 
 Scoring:
@@ -63,16 +68,35 @@ Search:
   -j, --jobs N              parallel compiles (default 1)
       --timeout SEC         compile timeout (default 120)
 
+Other functions (for helpers VC6 inlines into the target):
+      --also [FILE:]NAME    also permute this function. FILE is relative to the current
+                            directory or the source's; without it NAME is looked up in
+                            the source and the headers it includes. Repeatable
+      --inline-callees      also permute the inline functions the target calls: their
+                            definitions in the source (if marked inline) and in the
+                            headers it includes
+      --max-callees N       at most N of those (default 8)
+  -I, --include-dir DIR     where to look for #include "..." headers besides the
+                            including file's directory (default: the source's)
+      --mirror-root DIR     candidates are compiled in a mirror of this directory
+                            (symlinks plus the changed files), so changed headers are
+                            the ones every #include sees (default: the source's dir)
+      --list-regions        print the functions that would be permuted and exit
+
 Output:
   -o, --output-dir DIR      where improvements go (default: permuter_out)
-      --candidate-dir DIR   where candidate sources are written (default: next to
-                            the source, so relative #includes keep working)
       --config FILE         read "key = value" lines as if they were --key value
       --list-passes         list the passes and exit
       --show-ast            print the parsed statement tree and exit
       --dry-run             print the candidates' diffs instead of compiling
       --show-base-diff      print the asm diff of the unmodified function first
   -v, --verbose             print compile errors
+
+Checking the parser:
+      --check-parse FILE... parse every function in the files and run every pass on
+                            it; report functions that don't parse and candidates
+                            that don't parse back. Exit 1 on any
+      --check-limit N       candidates checked per pass and function (default 25)
 )";
 
 struct Options {
@@ -91,7 +115,11 @@ struct Options {
     int jobs = 1;
     int timeout = 120;
     std::string outputDir = "permuter_out";
-    std::string candidateDir;
+    std::vector<std::string> also, includeDirs, checkParse;
+    bool inlineCallees = false, listRegions = false, checkMode = false;
+    int maxCallees = 8;
+    long checkLimit = 25;
+    std::string mirrorRoot;
     bool listPasses = false, showAst = false, dryRun = false, showBaseDiff = false, verbose = false;
 };
 
@@ -151,7 +179,14 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "jobs" || key == "j") return num(o.jobs);
     if (key == "timeout") return num(o.timeout);
     if (key == "output-dir" || key == "o") return need() && (o.outputDir = val, true);
-    if (key == "candidate-dir") return need() && (o.candidateDir = val, true);
+    if (key == "also") return need() && (o.also.push_back(val), true);
+    if (key == "inline-callees") return o.inlineCallees = true;
+    if (key == "max-callees") return num(o.maxCallees);
+    if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
+    if (key == "mirror-root") return need() && (o.mirrorRoot = val, true);
+    if (key == "list-regions") return o.listRegions = true;
+    if (key == "check-parse") return o.checkMode = true;
+    if (key == "check-limit") return num(o.checkLimit);
     if (key == "list-passes") return o.listPasses = true;
     if (key == "show-ast") return o.showAst = true;
     if (key == "dry-run") return o.dryRun = true;
@@ -164,7 +199,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse",
     };
     return flags.count(k) > 0;
 }
@@ -216,8 +251,8 @@ bool parseArgs(int argc, char** argv, Options& o, std::string& err) {
         } else if (a.size() == 2 && a[0] == '-') {
             key = a.substr(1);
         } else {
-            err = "unexpected argument: " + a;
-            return false;
+            o.checkParse.push_back(a); // files for --check-parse
+            continue;
         }
         if (!hasVal && !isFlag(key) && i + 1 < argc) {
             val = argv[++i];
@@ -295,30 +330,62 @@ double lastNumber(const std::string& s, bool& ok) {
     return v;
 }
 
+// One text per region; [0] is the target function.
+using Cand = std::vector<std::string>;
+
+size_t hashCand(const Cand& c) {
+    std::string all;
+    for (auto& t : c) all += t + '\x01';
+    return std::hash<std::string>()(all);
+}
+
+struct Workspace {
+    std::vector<Region> regions;
+    Cand base;
+    std::map<std::string, std::string> files; // original contents of the files with regions
+    std::string root;
+
+    // New contents of every file that holds a region.
+    std::map<std::string, std::string> render(const Cand& c) const {
+        std::map<std::string, std::string> out;
+        for (auto& [file, text] : files) {
+            std::vector<std::pair<const Region*, const std::string*>> parts;
+            for (size_t i = 0; i < regions.size(); ++i)
+                if (regions[i].file == file) parts.push_back({&regions[i], &c[i]});
+            out[file] = spliceRegions(text, parts);
+        }
+        return out;
+    }
+};
+
 struct Evaluator {
     const Options& o;
+    const Workspace& ws;
     ScoreConfig sc;
-    std::string prefix, suffix, srcDir, stem, ext, symbol, targetSymbol;
+    std::string symbol, targetSymbol;
     std::vector<Insn> target;
-    std::vector<std::string> candPaths;
+    std::vector<Mirror> mirrors; // one per worker
 
-    std::string srcPath(int w) const {
-        std::string dir = o.candidateDir.empty() ? srcDir : o.candidateDir;
-        return (fs::path(dir) / (stem + ".permuter" + std::to_string(w) + ext)).string();
-    }
+    std::string srcPath(int w) const { return mirrors[w].map(ws.regions[0].file); }
     std::string objPath(int w) const {
         return (fs::path(o.outputDir) / ".work" / ("w" + std::to_string(w) + ".obj")).string();
     }
 
-    bool compile(int w, const std::string& funcText, std::string& log) const {
-        std::string src = srcPath(w), obj = objPath(w);
-        if (!writeFile(src, prefix + funcText + suffix)) {
-            log = "can't write " + src;
-            return false;
+    bool compile(int w, const Cand& c, std::string& log) const {
+        for (auto& [file, text] : ws.render(c)) {
+            std::string path = mirrors[w].map(file);
+            if (!writeFile(path, text)) {
+                log = "can't write " + path;
+                return false;
+            }
         }
+        std::string src = srcPath(w), obj = objPath(w);
         std::error_code ec;
         fs::remove(obj, ec);
-        std::string cmd = expandTemplate(o.compile, {{"src", src}, {"obj", obj}, {"dir", srcDir}});
+        std::string cmd = expandTemplate(o.compile, {{"src", src},
+                                                     {"obj", obj},
+                                                     {"dir", fs::path(src).parent_path().string()},
+                                                     {"root", mirrors[w].dir()}});
         CmdResult r = runCommand(cmd, o.timeout);
         log = r.output;
         if (r.timedOut) log += "\n(timed out)";
@@ -344,40 +411,63 @@ struct Evaluator {
         return scoreInsns(sc, target, mine);
     }
 
-    long eval(int w, const std::string& funcText, std::string& log, std::vector<Insn>* insns = nullptr) const {
-        if (!compile(w, funcText, log)) return -1;
+    long eval(int w, const Cand& c, std::string& log, std::vector<Insn>* insns = nullptr) const {
+        if (!compile(w, c, log)) return -1;
         return score(w, insns, log);
     }
 };
 
 struct State {
     std::mutex mu;
-    std::string baseText, bestText;
+    Cand base, best;
     long baseScore = 0, bestScore = 0;
     long compiles = 0, failures = 0, improvements = 0;
     std::unordered_set<size_t> seen;
     int outputs = 0;
 };
 
-void writeOutput(const Options& o, const Evaluator& ev, State& st, const std::string& text,
-                 long score, const std::vector<Insn>& insns) {
+// Diff of every region that changed, with a header per region when there are several.
+std::string candDiff(const Workspace& ws, const Cand& c) {
+    std::string out;
+    for (size_t i = 0; i < c.size(); ++i) {
+        if (c[i] == ws.base[i]) continue;
+        if (ws.regions.size() > 1) out += "@@ " + ws.regions[i].name + " (" + fs::path(ws.regions[i].file).filename().string() + ")\n";
+        out += lineDiff(ws.base[i], c[i]);
+    }
+    return out;
+}
+
+void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
+                 const std::vector<Insn>& insns) {
+    const Workspace& ws = ev.ws;
     std::string dir = (fs::path(o.outputDir) / ("output-" + std::to_string(score) + "-" +
                                                 std::to_string(++st.outputs)))
                           .string();
     fs::create_directories(dir);
-    writeFile(dir + "/function.cpp", text + "\n");
-    writeFile(dir + "/source.cpp", ev.prefix + text + ev.suffix);
-    writeFile(dir + "/diff.txt", lineDiff(st.baseText, text));
+    std::string funcs;
+    for (size_t i = 0; i < c.size(); ++i) {
+        if (i > 0 && c[i] == ws.base[i]) continue;
+        if (ws.regions.size() > 1) funcs += "// " + ws.regions[i].name + " in " + ws.regions[i].file + "\n";
+        funcs += c[i] + "\n\n";
+    }
+    writeFile(dir + "/function.cpp", funcs);
+    auto rendered = ws.render(c);
+    writeFile(dir + "/source.cpp", rendered[ws.regions[0].file]);
+    for (auto& [file, text] : rendered) // changed headers, under their own names
+        if (file != ws.regions[0].file && text != ws.files.at(file))
+            writeFile(dir + "/" + fs::path(file).filename().string(), text);
+    std::string diff = candDiff(ws, c);
+    writeFile(dir + "/diff.txt", diff);
     if (!insns.empty()) writeFile(dir + "/asm_diff.txt", diffInsns(ev.sc, ev.target, insns));
     writeFile(dir + "/score.txt", std::to_string(score) + "\n");
     std::cout << "\n[" << score << "] new best (was " << st.bestScore << "), written to " << dir
               << "\n"
-              << lineDiff(st.baseText, text) << std::flush;
+              << diff << std::flush;
 }
 
 // Records a scored candidate. Returns true if it was a match and we should stop.
-bool report(const Options& o, const Evaluator& ev, State& st, const std::string& text,
-            long score, const std::vector<Insn>& insns, const std::string& log) {
+bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
+            const std::vector<Insn>& insns, const std::string& log) {
     std::lock_guard<std::mutex> lk(st.mu);
     st.compiles++;
     if (score < 0) {
@@ -386,15 +476,13 @@ bool report(const Options& o, const Evaluator& ev, State& st, const std::string&
         return false;
     }
     if (score < st.bestScore) {
-        writeOutput(o, ev, st, text, score, insns);
+        writeOutput(o, ev, st, c, score, insns);
         st.bestScore = score;
-        st.bestText = text;
+        st.best = c;
         st.improvements++;
     }
     return score == 0 && !o.keepGoing;
 }
-
-size_t hashText(const std::string& s) { return std::hash<std::string>()(s); }
 
 void printStatus(State& st) {
     std::lock_guard<std::mutex> lk(st.mu);
@@ -403,36 +491,39 @@ void printStatus(State& st) {
               << std::flush;
 }
 
-// One random candidate derived from start; empty if nothing applied.
-std::string randomCandidate(const Options& o, const std::vector<PassGroup>& groups,
-                            const std::string& start, Rng& rng) {
+// One random candidate derived from start; empty if nothing applied. With
+// several regions, half the mutations go to the target function.
+Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, const Cand& start,
+                     Rng& rng) {
     int total = 0;
     for (auto& g : groups) total += g.weight();
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
-    std::string text = start;
+    Cand c = start;
     for (int m = 0; m < k; ++m) {
+        size_t r = 0;
+        if (c.size() > 1 && std::uniform_int_distribution<int>(0, 1)(rng) == 1)
+            r = std::uniform_int_distribution<size_t>(1, c.size() - 1)(rng);
         for (int attempt = 0; attempt < 10; ++attempt) {
-            int r = std::uniform_int_distribution<int>(0, total - 1)(rng);
+            int x = std::uniform_int_distribution<int>(0, total - 1)(rng);
             const PassGroup* g = &groups.back();
             for (auto& q : groups) {
-                if (r < q.weight()) {
+                if (x < q.weight()) {
                     g = &q;
                     break;
                 }
-                r -= q.weight();
+                x -= q.weight();
             }
             std::string out;
-            if (randomGroupMutation(*g, text, rng, out)) {
-                text = out;
+            if (randomGroupMutation(*g, c[r], rng, out)) {
+                c[r] = out;
                 break;
             }
         }
     }
-    return text == start ? "" : text;
+    return c == start ? Cand{} : c;
 }
 
-int runRandom(const Options& o, const Evaluator& ev, State& st,
-              const std::vector<PassGroup>& groups) {
+int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
     unsigned long long seed = o.seedSet ? o.seed : (unsigned long long)std::random_device{}();
     std::vector<std::thread> workers;
     std::atomic<int> idle{0};
@@ -441,19 +532,18 @@ int runRandom(const Options& o, const Evaluator& ev, State& st,
             Rng rng(seed + (unsigned long long)w * 7919);
             int misses = 0;
             while (!gStop) {
-                std::string start;
+                Cand start;
                 {
                     std::lock_guard<std::mutex> lk(st.mu);
                     if (o.iterations && st.compiles >= o.iterations) break;
-                    bool fromBest = st.bestText != st.baseText &&
-                                    std::uniform_int_distribution<int>(0, 1)(rng) == 0;
-                    start = fromBest ? st.bestText : st.baseText;
+                    bool fromBest = st.best != st.base && std::uniform_int_distribution<int>(0, 1)(rng) == 0;
+                    start = fromBest ? st.best : st.base;
                 }
-                std::string cand = randomCandidate(o, groups, start, rng);
+                Cand cand = randomCandidate(o, groups, start, rng);
                 bool fresh = false;
                 if (!cand.empty()) {
                     std::lock_guard<std::mutex> lk(st.mu);
-                    fresh = st.seen.insert(hashText(cand)).second;
+                    fresh = st.seen.insert(hashCand(cand)).second;
                 }
                 if (!fresh) {
                     if (++misses > 2000) break; // nothing new left to try
@@ -477,17 +567,32 @@ int runRandom(const Options& o, const Evaluator& ev, State& st,
     return 0;
 }
 
-int runExhaustive(const Options& o, const Evaluator& ev, State& st,
-                  const std::vector<PassGroup>& groups) {
+// Every candidate one pass or combo away from c, in any region.
+void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+                   const std::function<bool(const Cand&, const std::string&)>& emit) {
+    bool stop = false;
+    for (size_t r = 0; r < c.size() && !stop; ++r)
+        for (auto& g : groups) {
+            if (stop) break;
+            enumerateGroup(g, c[r], [&](const std::string& s) {
+                Cand n = c;
+                n[r] = s;
+                if (!emit(n, g.name())) stop = true;
+                return !stop;
+            });
+        }
+}
+
+int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
     std::mutex qmu;
     std::condition_variable qcv;
-    std::deque<std::string> queue;
+    std::deque<Cand> queue;
     bool done = false;
     long produced = 0;
 
     auto worker = [&](int w) {
         while (true) {
-            std::string cand;
+            Cand cand;
             {
                 std::unique_lock<std::mutex> lk(qmu);
                 qcv.wait(lk, [&] { return !queue.empty() || done || gStop; });
@@ -509,27 +614,25 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st,
     for (int w = 0; w < o.jobs; ++w) workers.emplace_back(worker, w);
 
     std::thread producer([&]() {
-        std::vector<std::string> level = {st.baseText};
+        std::vector<Cand> level = {st.base};
         for (int d = 1; d <= o.depth && !gStop; ++d) {
-            std::vector<std::string> next;
-            for (auto& text : level) {
-                for (auto& g : groups) {
-                    if (gStop || produced >= o.maxCandidates) break;
-                    enumerateGroup(g, text, [&](const std::string& s) {
-                        if (gStop || produced >= o.maxCandidates) return false;
-                        {
-                            std::lock_guard<std::mutex> lk(st.mu);
-                            if (!st.seen.insert(hashText(s)).second) return true;
-                        }
-                        produced++;
-                        if (d < o.depth) next.push_back(s);
-                        std::unique_lock<std::mutex> lk(qmu);
-                        qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
-                        queue.push_back(s);
-                        qcv.notify_all();
-                        return true;
-                    });
-                }
+            std::vector<Cand> next;
+            for (auto& c : level) {
+                if (gStop || produced >= o.maxCandidates) break;
+                enumerateCand(groups, c, [&](const Cand& n, const std::string&) {
+                    if (gStop || produced >= o.maxCandidates) return false;
+                    {
+                        std::lock_guard<std::mutex> lk(st.mu);
+                        if (!st.seen.insert(hashCand(n)).second) return true;
+                    }
+                    produced++;
+                    if (d < o.depth) next.push_back(n);
+                    std::unique_lock<std::mutex> lk(qmu);
+                    qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
+                    queue.push_back(n);
+                    qcv.notify_all();
+                    return true;
+                });
             }
             level = std::move(next);
         }
@@ -562,30 +665,123 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st,
     return 0;
 }
 
-int dryRun(const Options& o, const std::string& base, const std::vector<PassGroup>& groups) {
+int dryRun(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups) {
     if (o.mode == "exhaustive") {
         long count = 0;
-        std::unordered_set<size_t> seen;
-        for (auto& g : groups) {
-            long mine = 0;
-            enumerateGroup(g, base, [&](const std::string& s) {
-                if (!seen.insert(hashText(s)).second) return true;
-                mine++;
-                if (++count <= 50) std::cout << "=== " << g.name() << " #" << mine << "\n" << lineDiff(base, s);
-                return count < o.maxCandidates;
-            });
-            std::cerr << g.name() << ": " << mine << " candidates\n";
-        }
+        std::unordered_set<size_t> seen = {hashCand(ws.base)};
+        std::map<std::string, long> perGroup;
+        enumerateCand(groups, ws.base, [&](const Cand& c, const std::string& g) {
+            if (!seen.insert(hashCand(c)).second) return true;
+            perGroup[g]++;
+            if (++count <= 50) std::cout << "=== " << g << " #" << perGroup[g] << "\n" << candDiff(ws, c);
+            return count < o.maxCandidates;
+        });
+        for (auto& g : groups) std::cerr << g.name() << ": " << perGroup[g.name()] << " candidates\n";
         std::cerr << count << " candidates in total\n";
         return 0;
     }
     Rng rng(o.seedSet ? o.seed : 1);
     long n = o.iterations ? o.iterations : 10;
     for (long i = 0; i < n; ++i) {
-        std::string s = randomCandidate(o, groups, base, rng);
-        std::cout << "=== random #" << i + 1 << "\n" << (s.empty() ? "(no change)\n" : lineDiff(base, s));
+        Cand c = randomCandidate(o, groups, ws.base, rng);
+        std::cout << "=== random #" << i + 1 << "\n" << (c.empty() ? "(no change)\n" : candDiff(ws, c));
     }
     return 0;
+}
+
+// --check-parse: every function in the files must parse, and every pass's
+// candidates must parse back.
+int checkParse(const Options& o) {
+    long funcs = 0, parseFails = 0, others = 0, sites = 0, siteFails = 0, cands = 0, badCands = 0;
+    std::map<std::string, long> perPass;
+    for (auto& path : o.checkParse) {
+        std::string src;
+        if (!readFile(path, src)) {
+            std::cerr << "can't read " << path << "\n";
+            parseFails++;
+            continue;
+        }
+        for (auto& d : listDefinitions(src)) {
+            funcs++;
+            std::string text = src.substr(d.start, d.end - d.start);
+            std::string err;
+            auto f = parseFunc(text, err);
+            if (!f) {
+                parseFails++;
+                std::cout << "PARSE FAIL " << path << ": " << d.name << ": " << err << "\n";
+                continue;
+            }
+            forEachStmt(*f->body, [&](const Stmt& s) {
+                if (s.kind == SK::Other) {
+                    others++;
+                    if (o.verbose) std::cout << "other " << path << ": " << d.name << ": " << f->textOf(s).substr(0, 60) << "\n";
+                }
+            });
+            for (auto& site : exprSites(*f)) {
+                sites++;
+                if (!parseExpr(*f, site.b, site.e)) {
+                    siteFails++;
+                    if (o.verbose) std::cout << "expr " << path << ": " << d.name << ": " << f->tokText(site.b, site.e).substr(0, 60) << "\n";
+                }
+            }
+            for (auto& p : allPasses()) {
+                long n = 0;
+                p.enumerate(*f, [&](Mutation m) {
+                    std::string out = m();
+                    cands++;
+                    perPass[p.name]++;
+                    std::string e2;
+                    if (out.empty() || out == text || !parseFunc(out, e2)) {
+                        badCands++;
+                        std::cout << "BAD CANDIDATE " << path << ": " << d.name << " (" << p.name << ")"
+                                  << (out.empty() ? ": empty" : out == text ? ": unchanged" : ": " + e2) << "\n";
+                    }
+                    return ++n < o.checkLimit;
+                });
+            }
+        }
+    }
+    std::cout << o.checkParse.size() << " files, " << funcs << " functions, " << parseFails
+              << " failed to parse\n"
+              << others << " statements left unclassified (barriers), " << siteFails << " of "
+              << sites << " expressions not understood\n"
+              << cands << " candidates checked, " << badCands << " bad\n";
+    for (auto& [name, n] : perPass) std::cout << "  " << name << ": " << n << "\n";
+    return parseFails == 0 && badCands == 0 ? 0 : 1;
+}
+
+// Resolves "--also [FILE:]NAME" to a region.
+bool findAlso(const std::string& spec, const std::string& srcPath, const std::vector<std::string>& dirs,
+              Region& r, std::string& err) {
+    std::string file, name = spec;
+    size_t colon = spec.find(':');
+    while (colon != std::string::npos && colon + 1 < spec.size() && spec[colon + 1] == ':')
+        colon = spec.find(':', colon + 2); // skip "::"
+    if (colon != std::string::npos) {
+        file = spec.substr(0, colon);
+        name = spec.substr(colon + 1);
+    }
+    std::vector<std::string> files;
+    if (!file.empty()) {
+        // relative to the current directory, else to the source's
+        fs::path p = fs::absolute(file);
+        if (!fs::exists(p)) p = fs::path(srcPath).parent_path() / file;
+        files.push_back(fs::absolute(p).lexically_normal().string());
+    }
+    else {
+        files.push_back(srcPath);
+        for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+    }
+    for (auto& path : files) {
+        std::string text;
+        if (!readFile(path, text)) continue;
+        auto defs = findDefinitions(text, name);
+        if (defs.empty()) continue;
+        r = {path, defs[0].first, defs[0].second, name};
+        return true;
+    }
+    err = "--also " + spec + ": definition not found";
+    return false;
 }
 
 } // namespace
@@ -601,12 +797,24 @@ int main(int argc, char** argv) {
         for (auto& p : allPasses()) std::cout << "  " << p.name << "\n      " << p.description << "\n";
         return 0;
     }
+    if (o.checkMode) {
+        if (o.checkParse.empty()) {
+            std::cerr << "error: --check-parse needs files\n";
+            return 2;
+        }
+        return checkParse(o);
+    }
+    if (!o.checkParse.empty()) {
+        std::cerr << "error: unexpected argument: " << o.checkParse[0] << "\n";
+        return 2;
+    }
     if (o.source.empty() || o.function.empty()) {
         std::cerr << "error: --source and --function are required\n\n" << kUsage;
         return 2;
     }
+    std::string srcPath = fs::absolute(o.source).lexically_normal().string();
     std::string src;
-    if (!readFile(o.source, src)) {
+    if (!readFile(srcPath, src)) {
         std::cerr << "error: can't read " << o.source << "\n";
         return 1;
     }
@@ -640,7 +848,47 @@ int main(int argc, char** argv) {
         std::cerr << "error: --mode must be random or exhaustive\n";
         return 2;
     }
-    if (o.dryRun) return dryRun(o, funcText, groups);
+
+    // the functions to permute
+    Workspace ws;
+    std::vector<std::string> dirs = o.includeDirs;
+    if (dirs.empty()) dirs.push_back(fs::path(srcPath).parent_path().string());
+    ws.root = o.mirrorRoot.empty() ? fs::path(srcPath).parent_path().string()
+                                   : fs::absolute(o.mirrorRoot).lexically_normal().string();
+    ws.regions.push_back({srcPath, start, end, o.function});
+    auto addRegion = [&](const Region& r) {
+        for (auto& x : ws.regions)
+            if (x.file == r.file && x.start < r.end && r.start < x.end) return; // overlaps
+        ws.regions.push_back(r);
+    };
+    for (auto& spec : o.also) {
+        Region r;
+        if (!findAlso(spec, srcPath, dirs, r, err)) {
+            std::cerr << "error: " << err << "\n";
+            return 1;
+        }
+        addRegion(r);
+    }
+    if (o.inlineCallees)
+        for (auto& r : inlineCallees(srcPath, start, end, *func, dirs, (size_t)o.maxCallees)) addRegion(r);
+    for (auto& r : ws.regions) {
+        if (!ws.files.count(r.file) && !readFile(r.file, ws.files[r.file])) {
+            std::cerr << "error: can't read " << r.file << "\n";
+            return 1;
+        }
+        std::string text = ws.files[r.file].substr(r.start, r.end - r.start);
+        if (!parseFunc(text, err)) {
+            std::cerr << "error: can't parse " << r.name << ": " << err << "\n";
+            return 1;
+        }
+        ws.base.push_back(text);
+    }
+    if (o.listRegions || ws.regions.size() > 1) {
+        std::cout << "permuting:\n";
+        for (auto& r : ws.regions) std::cout << "  " << r.name << "  (" << r.file << ")\n";
+        if (o.listRegions) return 0;
+    }
+    if (o.dryRun) return dryRun(o, ws, groups);
 
     if (o.compile.empty() || (o.targetObj.empty() && o.scoreCmd.empty())) {
         std::cerr << "error: --compile and --target-obj (or --score-cmd) are required\n";
@@ -648,27 +896,31 @@ int main(int argc, char** argv) {
     }
     if (o.jobs < 1) o.jobs = 1;
 
-    Evaluator ev{o};
+    Evaluator ev{o, ws};
     ev.sc.objdump = o.objdump;
     ev.sc.ignoreRelocNames = o.ignoreRelocNames;
-    ev.prefix = src.substr(0, start);
-    ev.suffix = src.substr(end);
-    fs::path sp = fs::absolute(o.source);
-    ev.srcDir = sp.parent_path().string();
-    ev.stem = sp.stem().string();
-    ev.ext = sp.extension().string();
-    fs::create_directories(fs::path(o.outputDir) / ".work");
+    std::vector<std::string> realFiles;
+    for (auto& [file, text] : ws.files) realFiles.push_back(file);
+    for (int w = 0; w < o.jobs; ++w) {
+        Mirror m;
+        std::string dir = (fs::path(o.outputDir) / ".work" / ("w" + std::to_string(w))).string();
+        if (!m.create(ws.root, dir, realFiles, err)) {
+            std::cerr << "error: " << err << "\n";
+            return 1;
+        }
+        ev.mirrors.push_back(m);
+    }
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     auto cleanup = [&]() {
         std::error_code ec;
-        for (int w = 0; w < o.jobs; ++w) fs::remove(ev.srcPath(w), ec);
+        for (auto& m : ev.mirrors) fs::remove_all(m.dir(), ec);
     };
 
-    // the unmodified function
+    // the unmodified functions
     std::string log;
-    if (!ev.compile(0, funcText, log)) {
+    if (!ev.compile(0, ws.base, log)) {
         std::cerr << "error: the unmodified source doesn't compile:\n" << log << "\n";
         cleanup();
         return 1;
@@ -705,9 +957,9 @@ int main(int argc, char** argv) {
     std::cout << "base score: " << base << "\n";
 
     State st;
-    st.baseText = st.bestText = funcText;
+    st.base = st.best = ws.base;
     st.baseScore = st.bestScore = base;
-    st.seen.insert(hashText(funcText));
+    st.seen.insert(hashCand(ws.base));
     if (base == 0) {
         std::cout << "already matching\n";
         cleanup();

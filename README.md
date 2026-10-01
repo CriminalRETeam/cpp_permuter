@@ -11,7 +11,8 @@ How it works:
 1. Find the function in the `.cpp` and parse its body into statements, declarations and
    expressions.
 2. Make candidates by applying mutation passes (reorder local saves, inline a local, move
-   declarations in and out of blocks, swap operands, invert an `if`, ...).
+   declarations in and out of blocks, swap operands, invert an `if`, ...). Optionally do the
+   same to the inline helpers the function calls.
 3. Splice each candidate back into the file, compile it with your compile command, and
    disassemble the function from the object with `llvm-objdump`.
 4. Score it against the target: 0 means identical, lower is closer. Improvements are written
@@ -40,7 +41,7 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 |---|---|
 | `-s/--source` | the `.cpp` holding the function |
 | `-f/--function` | `Class::Method`, `Method`, `Class::Class`, `Class::~Class` |
-| `-c/--compile` | compile command. `{src}` is the candidate source, `{obj}` the object it must write, `{dir}` the original source's directory |
+| `-c/--compile` | compile command. `{src}` is the candidate source, `{obj}` the object it must write, `{dir}` the candidate's directory, `{root}` the mirror's root (see below) |
 | `-t/--target-obj` | object file holding the target code |
 | `--symbol`, `--target-symbol` | symbol names, if the guess from `--function` is wrong (MSVC `?Name@Class@@...`, Itanium, or C) |
 | `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output |
@@ -54,19 +55,52 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--show-base-diff` | print the target/base asm alignment before starting |
 | `--config FILE` | `key = value` lines, same keys as the long options. Handy for one config per function |
 | `--keep-going` | keep searching after an exact match |
+| `--inline-callees`, `--also [FILE:]NAME` | also permute inline helpers the function calls, see below |
+| `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
 
 Each improvement goes to `permuter_out/output-<score>-<n>/`:
 
-- `function.cpp`: the permuted function.
+- `function.cpp`: the permuted function (and any helper that changed).
 - `source.cpp`: the whole file.
+- `<header>.hpp`: each header that changed, when helpers were permuted.
 - `diff.txt`: what changed.
 - `asm_diff.txt`: target and candidate asm aligned side by side.
 
 The exit status is 0 if a match was found and 3 if not.
 
-Candidate sources are written next to the original (`PedGroup.permuter0.cpp`, ...) so relative
-`#include`s still resolve. They are deleted on exit. `--candidate-dir` puts them somewhere
-else.
+Candidates are compiled in a mirror of the source's directory under
+`permuter_out/.work/w<N>/`, one per worker. The mirror is built from symlinks to every entry,
+plus real copies of the files the permuter edits. Your files are never written to. File names
+stay the same, and every `#include "..."` resolves inside the mirror, so an edited header is
+the one that every file includes. `--mirror-root DIR` mirrors a larger tree when the edited
+files aren't all under the source's directory.
+
+## Inline helpers
+
+VC6 inlines small helpers (getters, `Fix16::Abs`, `Max`, ...) into their callers, so a
+function can be off only because a helper is written differently. The permuter can work on
+those too:
+
+```sh
+--inline-callees            # the inline functions this function calls
+--also fix16.hpp:Max        # a particular function, by file (relative to . or the source)
+--also Fix16::Max           # ... or looked up in the source and the headers it includes
+--list-regions              # print what would be permuted, then exit
+```
+
+`--inline-callees` looks for definitions of the called names in these places:
+
+- the headers the source reaches through `#include "..."` (searched in the including file's
+  directory, then in `-I` dirs);
+- the source itself, for functions marked `inline`.
+
+Overloads whose parameter count can't fit any call are skipped. The first definition of
+every name is taken before any second overload, up to `--max-callees` (default 8).
+
+Every pass then also works on those helpers. Half of the random mutations go to the target
+function, and exhaustive mode tries every pass on every function. Only the target function
+is scored. When a candidate matches, the output has the changed headers next to
+`source.cpp`.
 
 ## Combining passes
 
@@ -102,6 +136,16 @@ above, plus each pass applied twice.
 | `invert_if` | `if (c) A else B` becomes `if (!c) B else A`, negating comparisons directly |
 | `ternary` | `x = c ? a : b` and `return c ? a : b` become `if`/`else` (and an early-return form), and back |
 | `compound_assign` | `x = x op y` and `x op= y`, both ways |
+| `bool_return` | `return a <= b;` and `if (a <= b) return true; return false;` (also with `else`, and with `1`/`0`), both ways |
+| `ternary_arg` | `f(c ? a : b);` and `if (c) f(a); else f(b);`, both ways. Going back, two branches that differ in one sub-expression become one statement with a ternary |
+| `switch_if` | `if (x == K) S else D` and `switch (x) { case K: S break; default: D }`, both ways (the one-case switch quirk) |
+| `early_return` | `if (c) { ...; return; } else { B }` and `if (c) { ...; return; } B`, both ways (also `break`, `continue`, `goto`) |
+| `branch_dup` | Move a statement that both branches start or end with out of the `if`, or copy the statement before or after an `if`/`else` into both branches |
+| `cond_split` | `if (a && b) S` and `if (a) { if (b) S }`, both ways |
+| `explicit_compare` | `if (x)` and `if (x != 0)`, `if (!x)` and `if (x == 0)`, in conditions |
+| `negate_const` | `x - 4` and `x + -4`, `x -= 4` and `x += -4` (the `sub` vs `add -N` quirk) |
+| `loop_form` | `for (i; c; s) B` and `i; while (c) { B s; }`, `while (c)` and `for (; c;)` |
+| `reassociate` | `a + b + c` and `a + (b + c)`, for `+ * & \| ^` |
 
 The passes aim to keep behaviour the same, but they don't prove it. For example they assume
 that two different fields don't alias. That is fine here, because a candidate that matches the
@@ -121,6 +165,13 @@ Running clang on the whole file instead would mean the code has to compile under
 code with its own headers, `__asm` and naked marker functions doesn't, and clang's error
 recovery drops the very declarations we want to move.
 
+On gta2_re (`--check-parse Source/*.cpp Source/*.hpp`):
+
+- all 4,235 functions in 231 files parse;
+- 2 of 53,552 expressions are not understood (a `decltype` cast and a function-pointer cast);
+- 4 statements stay barriers (a `typedef`, two `using namespace`, a local `struct`);
+- every candidate that every pass produces parses back.
+
 ## Scoring
 
 The function is disassembled with `llvm-objdump -d -r --disassemble-symbols=<sym>`. Before
@@ -137,28 +188,66 @@ or a deletion. The weights are the same idea as decomp-permuter's.
 
 ## Tests
 
-`ctest --test-dir build` runs three suites:
+`ctest --test-dir build` runs four suites.
 
-- `unit` (`tests/tests.cpp`): the lexer, parser, effects, each pass, pass combos, and the
-  scorer.
-- `integration` (`tests/integration/run.sh`): each case directory has a `base.cpp` that is
-  wrong in some way and the `target.cpp` that the target object is built from. The permuter
-  must match the target, and where it should, give back exactly `target.cpp`. Negative controls
-  run the wrong passes and must *not* match, which shows the match comes from the pass under
-  test. The cases are:
-  - `var_reorder`: local saves out of order;
-  - `combo`: saves out of order plus an inverted `if`. Single passes fail and the combo
-    matches;
-  - `inline_local`: a local the original didn't have;
-  - `ops`: swapped operands.
+`unit` (`tests/tests.cpp`) covers:
 
-  The compiler is clang's i686 MSVC target at `-O0`, where statement order shows up directly in
-  the code.
-- `vc6` (`tests/integration/vc6.sh`): the same proof with the real MSVC 6 under wine, on
-  gta2_re's `PedGroup::PromoteMemberToLeader_4C9680`. That function already matches, so VC6's
-  code for it is the original game's code. The test scrambles the four weapon saves (and
-  inverts an `if`) and checks that the permuter recovers the exact original source. It needs
-  `GTA2_RE` set and wine installed, and is skipped otherwise.
+- the lexer and the parser, including listing every definition in a file;
+- the effects analysis;
+- every pass, in both directions where it has two;
+- pass combos;
+- the scorer;
+- finding inline callees;
+- the mirror, including a source tree made of symlinks.
+
+`integration` (`tests/integration/run.sh`) needs clang and llvm-objdump. It uses clang's
+i686 MSVC target at `-O0`, where statement order and expression shape show up directly in the
+code. Each case has a `base/` directory that is wrong in some way, and a `target/` directory
+that the target object is built from: `main.cpp`, plus any headers. The permuter must match
+the target, and where it should, give back exactly the target sources. Negative controls run
+without the pass under test (usually: with every other pass) and must *not* match, which
+shows the match comes from that pass. The cases are:
+
+- `var_reorder`: local saves out of order.
+- `combo`: saves out of order plus an inverted `if`. Single passes fail and the combo matches.
+- `inline_local`: a local the original didn't have.
+- `ops`: swapped operands.
+- One case for each of `bool_return`, `ternary_arg`, `switch_if`, `branch_dup`, `cond_split`,
+  `negate_const` and `reassociate`.
+- `inline_callee`: the function is right, but the `__forceinline` helper in its header isn't.
+  It is found by `--inline-callees`, `--also NAME` and `--also FILE:NAME`. Without them there
+  is no match.
+
+`early_return`, `explicit_compare` and `loop_form` compile identically at clang `-O0`, so only
+the unit tests cover them.
+
+`gta2_parse` (`tests/integration/gta2_parse.sh`) runs `--check-parse` over every gta2_re
+source and header. It fails if any of these happen:
+
+- a function doesn't parse;
+- a candidate doesn't parse back, or is a no-op;
+- more than 0.1% of expressions, or more than 10 statements, aren't understood.
+
+`vc6` (`tests/integration/vc6.sh`) uses real MSVC 6 under wine, on gta2_re functions that
+already match, so VC6's code for them is the original game's code. Each case breaks a
+function the way a decompiler might, and checks that the permuter recovers the exact original
+source. A control without the needed pass must not match. It works in a symlinked copy of
+`Source/` and never modifies the checkout. The cases are:
+
+- `PedGroup::PromoteMemberToLeader_4C9680`: the four weapon saves in three different orders;
+  and the saves out of order plus an inverted `if`, which only the combo fixes.
+- `PedGroup::RemovePed_4C9970`: `ternary_arg`, the `if`/`else` around a call (from
+  `matching_quirks.md`).
+- `sound_obj::IsTrainOrBoxcar_57F120`: `bool_return` (from `matching_quirks.md`).
+- `Particle_4C::UpdateShortAnim_state_37_53B580`: `switch_if`.
+- `Fix16::Max` with its comparison mirrored, and `Fix16::Abs` written as a ternary, in
+  `fix16.hpp`, as inlined into `PedGroup` functions. They are recovered through
+  `--inline-callees` and `--also`; permuting only the calling function doesn't match.
+- 60 random candidates from every pass on `RemovePed`: at most 10% may fail to compile.
+  None did.
+
+`gta2_parse` and `vc6` need `GTA2_RE` set to a gta2_re checkout, and `vc6` also needs wine.
+Without them they are reported as skipped.
 
 ## gta2_re
 

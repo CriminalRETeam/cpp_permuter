@@ -1,6 +1,7 @@
 #include "passes.hpp"
 
 #include "analysis.hpp"
+#include "pass_util.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -60,9 +61,9 @@ std::string Rewriter::apply() const {
 }
 
 // ---------------------------------------------------------------------------
-// helpers
+// helpers (shared with the other pass files through pass_util.hpp)
 
-namespace {
+namespace util {
 
 std::vector<const Stmt*> blocksOf(const Func& f) {
     std::vector<const Stmt*> r;
@@ -601,20 +602,6 @@ void enumMergeDecl(const Func& f, const EmitFn& emit) {
 // ---------------------------------------------------------------------------
 // expression passes
 
-template <class Fn>
-void forEachSiteExpr(const Func& f, Fn fn) {
-    for (auto& site : exprSites(f)) {
-        auto x = parseExpr(f, site.b, site.e);
-        if (!x) continue;
-        std::shared_ptr<Expr> root(std::move(x));
-        bool stop = false;
-        forEachExpr(*root, [&](Expr& e) {
-            if (!stop && !fn(site, root, e)) stop = true;
-        });
-        if (stop) return;
-    }
-}
-
 void enumSwapOperands(const Func& f, const EmitFn& emit) {
     forEachSiteExpr(f, [&](const ExprSite&, std::shared_ptr<Expr> root, Expr& x) {
         if (x.k != Expr::Binary) return true;
@@ -624,6 +611,7 @@ void enumSwapOperands(const Func& f, const EmitFn& emit) {
         int p = binPrec(op);
         const Expr& l = *x.kids[0];
         const Expr& r = *x.kids[1];
+        if (norm(exprText(f, l)) == norm(exprText(f, r))) return true; // "x * x"
         bool assoc = op == "+" || op == "*" || op == "&" || op == "|" || op == "^";
         std::string lt = exprText(f, l);
         if (exprPrec(f, l) < p || (exprPrec(f, l) == p && !(assoc && f.t(l.op) == op)))
@@ -827,11 +815,12 @@ void enumCompoundAssign(const Func& f, const EmitFn& emit) {
     });
 }
 
-} // namespace
+} // namespace util
 
 // ---------------------------------------------------------------------------
 
 const std::vector<Pass>& allPasses() {
+    using namespace util;
     static const std::vector<Pass> passes = {
         {"reorder_saves",
          "Permute runs of consecutive local saves (declarations and assignments to locals "
@@ -863,6 +852,34 @@ const std::vector<Pass>& allPasses() {
         {"ternary", "Turn 'x = c ? a : b' / 'return c ? a : b' into if/else and back", 8,
          enumTernary, nullptr},
         {"compound_assign", "'x = x op y' <-> 'x op= y'", 8, enumCompoundAssign, nullptr},
+        {"bool_return",
+         "'return a <= b;' <-> 'if (a <= b) return true; return false;' (with and without "
+         "else, true/false and 1/0)",
+         8, enumBoolReturn, nullptr},
+        {"ternary_arg",
+         "'f(c ? a : b);' <-> 'if (c) f(a); else f(b);': a ternary inside a statement, and two "
+         "branches that differ in one sub-expression",
+         8, enumTernaryArg, nullptr},
+        {"switch_if", "'if (x == K) S else D' <-> 'switch (x) { case K: S break; default: D }'", 6,
+         enumSwitchIf, nullptr},
+        {"early_return",
+         "'if (c) { ...return; } else { B }' <-> 'if (c) { ...return; } B' (also break, "
+         "continue, goto)",
+         10, enumEarlyReturn, nullptr},
+        {"branch_dup",
+         "Hoist a statement both branches start or end with out of the if, or copy the "
+         "statement before/after an if/else into both branches",
+         10, enumBranchDup, nullptr},
+        {"cond_split", "'if (a && b) S' <-> 'if (a) { if (b) S }'", 8, enumCondSplit, nullptr},
+        {"explicit_compare", "'if (x)' <-> 'if (x != 0)', 'if (!x)' <-> 'if (x == 0)'", 8,
+         enumExplicitCompare, nullptr},
+        {"negate_const", "'x - 4' <-> 'x + -4', 'x -= 4' <-> 'x += -4'", 6, enumNegateConst, nullptr},
+        {"loop_form",
+         "for <-> while: 'for (i; c; s) B' <-> 'i; while (c) { B s; }', 'while (c)' <-> "
+         "'for (; c;)'",
+         6, enumLoopForm, nullptr},
+        {"reassociate", "'a + b + c' <-> 'a + (b + c)' (for + * & | ^)", 6, enumReassociate,
+         nullptr},
     };
     return passes;
 }

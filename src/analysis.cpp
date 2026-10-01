@@ -103,6 +103,7 @@ struct ExprParser {
         }
         if (n.kind == TokKind::Ident) return !isKeyword(n.text) || n.text == "this" ||
                                               n.text == "sizeof" || n.text == "true" ||
+                                              n.text == "operator" || n.text == "new" ||
                                               n.text == "false" || isBuiltinType(n.text);
         return n.kind != TokKind::PP && n.kind != TokKind::End;
     }
@@ -206,8 +207,51 @@ struct ExprParser {
                 x->kids.push_back(std::move(o));
                 return x;
             }
-            if (t.text == "new" || t.text == "delete" || t.text == "throw")
-                return fail = true, nullptr;
+            if (t.text == "delete") {
+                // delete p, delete[] p
+                pos++;
+                if (at("[") && pos + 1 < end && T[pos + 1].text == "]") pos += 2;
+                auto o = unary();
+                if (!o) return nullptr;
+                auto x = node(Expr::Unary, b);
+                x->op = b;
+                x->e = o->e;
+                x->kids.push_back(std::move(o));
+                return x;
+            }
+            if (t.text == "new") {
+                // new T, new T(args), new T[n], new (place) T(...)
+                pos++;
+                if (at("(")) {
+                    int c = matchBracket(T, pos);
+                    if (c < 0 || c >= end) return fail = true, nullptr;
+                    pos = c + 1;
+                }
+                if (at("::")) pos++;
+                if (pos >= end || T[pos].kind != TokKind::Ident) return fail = true, nullptr;
+                while (pos < end && (isBuiltinType(T[pos].text) || T[pos].text == "const")) pos++;
+                if (pos < end && T[pos].kind == TokKind::Ident && !isBuiltinType(T[pos].text)) {
+                    pos++;
+                    while (at("::") && pos + 1 < end && T[pos + 1].kind == TokKind::Ident) pos += 2;
+                }
+                while (at("*")) pos++;
+                auto x = node(Expr::Call, b);
+                if (at("(") || at("[")) {
+                    bool idx = at("[");
+                    int c = matchBracket(T, pos);
+                    if (c < 0 || c >= end) return fail = true, nullptr;
+                    if (c > pos + 1) {
+                        ExprParser a(f, pos + 1, c);
+                        auto arg = a.parse(idx ? 1 : 1);
+                        if (!arg || a.pos != c) return fail = true, nullptr;
+                        x->kids.push_back(std::move(arg));
+                    }
+                    pos = c + 1;
+                }
+                x->e = pos;
+                return x;
+            }
+            if (t.text == "throw") return fail = true, nullptr;
         }
         return postfix(primary());
     }
@@ -251,6 +295,14 @@ struct ExprParser {
                 auto x = node(Expr::Cast, b);
                 x->e = pos;
                 x->kids.push_back(std::move(in));
+                return x;
+            }
+            if (s == "operator" && pos + 1 < end) {
+                // operator new(...), operator delete(...), operator==(...)
+                pos += 2;
+                if (at("[") && pos + 1 < end && T[pos + 1].text == "]") pos += 2;
+                auto x = node(Expr::Primary, b);
+                x->e = pos;
                 return x;
             }
             if (t.kind == TokKind::Ident && isKeyword(s) && s != "this" && s != "true" &&
@@ -297,7 +349,21 @@ struct ExprParser {
                 while (p < close) {
                     ExprParser a(f, p, close);
                     auto arg = a.parse(2);
-                    if (!arg) return fail = true, nullptr;
+                    if (!arg) {
+                        // not an expression (a type passed to a macro such as
+                        // va_arg): keep it as an opaque operand
+                        int q = p, depth = 0;
+                        for (; q < close; ++q) {
+                            const std::string& x = T[q].text;
+                            if (x == "(" || x == "[" || x == "{") depth++;
+                            else if (x == ")" || x == "]" || x == "}") depth--;
+                            else if (x == "," && depth == 0) break;
+                        }
+                        if (q == p) return fail = true, nullptr;
+                        arg = node(Expr::Primary, p);
+                        arg->e = q;
+                        a.pos = q;
+                    }
                     c->kids.push_back(std::move(arg));
                     p = a.pos;
                     if (p < close) {

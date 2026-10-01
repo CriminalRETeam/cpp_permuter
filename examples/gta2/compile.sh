@@ -8,6 +8,10 @@
 # submodule. EXTRA_CFLAGS adds per-file flags (cmake/vc6.cmake), e.g. "/Gz" for
 # Network_20324.cpp.
 #
+# The source's own directory stands in for Source/ on the include path, so a
+# candidate compiled in cpp_permuter's mirror of Source/ sees the mirror's
+# (possibly edited) headers everywhere.
+#
 # Use it as: cpp_permuter -c 'examples/gta2/compile.sh {src} {obj}' ...
 set -e
 SRC=$1
@@ -24,7 +28,7 @@ export LIB="$(winpath "$TOOLS/VC98/Lib")"
 
 # cl.exe exits 0 on warnings and 2 on errors; its output goes to stdout.
 wine cl.exe /nologo /TP /c \
-    /I"$(winpath "$GTA2_RE/Source")" /I"$(winpath "$GTA2_RE")" /I"$(winpath "$TOOLS")" \
+    /I"$(winpath "$(dirname "$SRC")")" /I"$(winpath "$GTA2_RE")" /I"$(winpath "$TOOLS")" \
     /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /D_CRT_NON_CONFORMING_SWPRINTFS /DIMGUI_DLL \
     /W3 /Zm1000 /EHsc /GX /ML /O2 /DNDEBUG $EXTRA_CFLAGS \
     /Fo"$(winpath "$OBJ")" "$(winpath "$SRC")"

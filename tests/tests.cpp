@@ -5,8 +5,13 @@
 #include "parser.hpp"
 #include "passes.hpp"
 #include "scorer.hpp"
+#include "workspace.hpp"
+
+#include <filesystem>
+#include <fstream>
 
 #include <iostream>
+#include <unistd.h>
 #include <set>
 
 using namespace perm;
@@ -349,7 +354,231 @@ void G::f(u8 idx)
     CHECK(contains(out, "if (idx >= 3)")); // invert_if always has something to do
 }
 
+// Every variant of pass on src (one function named f) must contain all of want
+// somewhere; and the variants must all parse again.
+static std::vector<std::string> run(const std::string& src, const std::string& pass) {
+    auto f = parse(src, "f");
+    CHECK(f != nullptr);
+    if (!f) return {};
+    auto v = variants(*f, pass);
+    for (auto& s : v) {
+        std::string err;
+        CHECK(parseFunc(s, err) != nullptr);
+    }
+    return v;
+}
+
+static bool any(const std::vector<std::string>& v, std::initializer_list<const char*> want) {
+    for (auto& s : v) {
+        bool all = true;
+        for (auto* w : want) all &= contains(s, w);
+        if (all) return true;
+    }
+    return false;
+}
+
+static void testBoolReturn() {
+    auto v = run("bool f(int a, int b)\n{\n    return a <= b;\n}\n", "bool_return");
+    CHECK(any(v, {"if (a <= b)\n    {\n        return true;\n    }\n    return false;"}));
+    CHECK(any(v, {"return 1;", "else", "return 0;"}));
+    auto r = run("bool f(int a, int b)\n{\n    if (a <= b)\n    {\n        return true;\n    }\n"
+                 "    return false;\n}\n", "bool_return");
+    CHECK(any(r, {"return a <= b;"}) && !any(r, {"return true"}));
+    auto n = run("bool f(int a, int b)\n{\n    if (a <= b) return 0; else return 1;\n}\n", "bool_return");
+    CHECK(any(n, {"return a > b;"}));
+    CHECK(run("int f(int a)\n{\n    return a + 1;\n}\n", "bool_return").empty());
+}
+
+static void testTernaryArg() {
+    auto v = run("void f(P* p, int x)\n{\n    p->g(x == 0 ? 1 : 0);\n}\n", "ternary_arg");
+    CHECK(any(v, {"if (x == 0)\n    {\n        p->g(1);\n    }\n    else\n    {\n        p->g(0);\n    }"}));
+    auto r = run("void f(P* p, int x)\n{\n    if (x == 0)\n        p->g(1, 2);\n    else\n"
+                 "        p->g(0, 2);\n}\n", "ternary_arg");
+    CHECK(any(r, {"p->g(x == 0 ? 1 : 0, 2);"}));
+    auto r2 = run("void f(P* p, int x)\n{\n    if (x)\n        y = p->a + 1;\n    else\n"
+                  "        y = p->b + 1;\n}\n", "ternary_arg");
+    CHECK(any(r2, {"y = (x ? p->a : p->b) + 1;"}));
+}
+
+static void testSwitchIf() {
+    auto v = run("void f(int n)\n{\n    if (n == 1)\n    {\n        a();\n    }\n    else\n    {\n"
+                 "        b();\n    }\n}\n", "switch_if");
+    CHECK(any(v, {"switch (n)\n    {\n        case 1:\n            a();\n            break;\n"
+                  "        default:\n            b();\n            break;\n    }"}));
+    auto r = run("void f(int n)\n{\n    switch (n)\n    {\n        case 1:\n            a();\n"
+                 "            break;\n    }\n}\n", "switch_if");
+    CHECK(any(r, {"if (n == 1)\n    {\n        a();\n    }"}));
+    // two cases, or a break inside the body, can't be an if
+    CHECK(run("void f(int n)\n{\n    switch (n) { case 1: a(); break; case 2: b(); break; }\n}\n",
+              "switch_if").empty());
+    CHECK(run("void f(int n)\n{\n    while (1) { if (n == 1) { break; } }\n}\n", "switch_if").empty());
+}
+
+static void testEarlyReturn() {
+    auto v = run("int f(int n)\n{\n    if (n)\n    {\n        a();\n        return 1;\n    }\n"
+                 "    else\n    {\n        b();\n    }\n    return 0;\n}\n", "early_return");
+    CHECK(any(v, {"        return 1;\n    }\n    b();\n    return 0;"}) && !any(v, {"else"}));
+    auto r = run("int f(int n)\n{\n    if (n)\n    {\n        return 1;\n    }\n    b();\n"
+                 "    return 0;\n}\n", "early_return");
+    CHECK(any(r, {"    else\n    {\n        b();\n        return 0;\n    }"}));
+}
+
+static void testBranchDup() {
+    auto v = run("void f(int n)\n{\n    x = 1;\n    if (n)\n    {\n        a();\n        t();\n    }\n"
+                 "    else\n    {\n        b();\n        t();\n    }\n    y = 2;\n}\n", "branch_dup");
+    CHECK(any(v, {"        a();\n    }\n    else\n    {\n        b();\n    }\n    t();"}));
+    CHECK(any(v, {"        t();\n        y = 2;\n    }"}));          // next stmt into both
+    CHECK(any(v, {"    {\n        x = 1;\n        a();", "        x = 1;\n        b();"})); // prev into both
+    // the previous statement can't move past a condition that reads it
+    auto w = run("void f(int n)\n{\n    n = g();\n    if (n) a(); else b();\n}\n", "branch_dup");
+    CHECK(!any(w, {"n = g();\n        a();"}));
+}
+
+static void testCondSplit() {
+    auto v = run("void f(int a, int b)\n{\n    if (a && b)\n        g();\n}\n", "cond_split");
+    CHECK(any(v, {"if (a)\n    {\n        if (b)\n            g();\n    }"}));
+    auto r = run("void f(int a, int b)\n{\n    if (a || c)\n    {\n        if (b)\n            g();\n    }\n}\n",
+                 "cond_split");
+    CHECK(any(r, {"if ((a || c) && b)\n        g();"}));
+    CHECK(run("void f(int a, int b)\n{\n    if (a && b) g(); else h();\n}\n", "cond_split").empty());
+}
+
+static void testExplicitCompare() {
+    auto v = run("void f(P* p, int x)\n{\n    if (!p || x)\n        g();\n    while (p->n != 0)\n"
+                 "        h();\n    if (x == 0) k();\n}\n", "explicit_compare");
+    CHECK(any(v, {"if (p == 0 || x)"}));
+    CHECK(any(v, {"if (!p || x != 0)"}));
+    CHECK(any(v, {"while (p->n)"}));
+    CHECK(any(v, {"if (!x) k();"}));
+}
+
+static void testNegateConst() {
+    auto v = run("void f(int x)\n{\n    y = x - 4;\n    x -= 0x100;\n    z = x + -2;\n}\n", "negate_const");
+    CHECK(any(v, {"y = x + -4;"}) && any(v, {"x += -0x100;"}) && any(v, {"z = x - 2;"}));
+}
+
+static void testLoopForm() {
+    auto v = run("void f(int n)\n{\n    for (i = 0; i < n; i++)\n    {\n        g(i);\n    }\n}\n", "loop_form");
+    CHECK(any(v, {"i = 0;\n    while (i < n)\n    {\n        g(i);\n        i++;\n    }"}));
+    auto r = run("void f(int n)\n{\n    int i;\n    i = 0;\n    while (i < n)\n    {\n        g(i);\n        i++;\n    }\n}\n",
+                 "loop_form");
+    CHECK(any(r, {"for (i = 0; i < n; i++)\n    {\n        g(i);\n    }"}));
+    CHECK(any(r, {"for (; i < n;)"}));
+    auto w = run("void f(int n)\n{\n    while (1)\n        g();\n}\n", "loop_form");
+    CHECK(any(w, {"for (;;)\n        g();"}));
+    // continue would skip the step once it's inside the body
+    CHECK(run("void f(int n)\n{\n    for (i = 0; i < n; i++) { if (i) continue; g(); }\n}\n", "loop_form").empty());
+}
+
+static void testReassociate() {
+    auto v = run("int f(int a, int b, int c)\n{\n    return a + b + c;\n}\n", "reassociate");
+    CHECK(any(v, {"return a + (b + c);"}));
+    auto r = run("int f(int a, int b, int c)\n{\n    return a * (b * c);\n}\n", "reassociate");
+    CHECK(any(r, {"return a * b * c;"}));
+}
+
+static void writeTo(const std::filesystem::path& p, const std::string& text) {
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream(p) << text;
+}
+
+static std::string readFrom(const std::filesystem::path& p) {
+    std::ifstream in(p);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
+static void testListDefinitions() {
+    std::string src = R"(
+MATCH_FUNC(0x1)
+void A::f(int x)
+{
+    if (x) { g(); }
+}
+STUB_FUNC(0x2)
+A::A() : m(1), n{2} { }
+struct B {
+    int get() const { return v; }
+    inline void set(int x) throw() { v = x; }
+};
+void decl(int);
+int A::operator==(const A& o) { return 1; }
+)";
+    std::set<std::string> names;
+    for (auto& d : listDefinitions(src)) names.insert(d.name);
+    CHECK(names == (std::set<std::string>{"A::f", "A::A", "get", "set"}));
+    // the macro before a definition isn't one
+    CHECK(findDefinitions(src, "MATCH_FUNC").empty());
+}
+
+static void testWorkspace() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / ("cpp_permuter_test_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    writeTo(dir / "src/main.cpp", "#include \"a.hpp\"\n#include <vector>\n\nint Main(P* p)\n{\n"
+                                  "    return Weight(p->a) + Weight(p->a, 2) + Helper(p) + p->Get();\n}\n"
+                                  "inline int Helper(P* p) { return p->b; }\nint NotInline(P* p) { return 0; }\n");
+    writeTo(dir / "src/a.hpp", "#include \"sub/b.hpp\"\nstruct P { int a, b; int Get() { return a; } };\n"
+                               "inline int Weight(int x) { return x * 4; }\n"
+                               "inline int Weight(int x, int y) { return x * y; }\n"
+                               "inline int Weight(int x, int y, int z) { return x * y * z; }\n");
+    writeTo(dir / "src/sub/b.hpp", "inline int Unrelated() { return 1; }\n");
+
+    auto inc = includedFiles((dir / "src/main.cpp").string(), {});
+    CHECK(inc.size() == 2);
+
+    std::string src = readFrom(dir / "src/main.cpp");
+    size_t b, e;
+    std::string err;
+    CHECK(locateFunction(src, "Main", b, e, err));
+    auto f = parseFunc(src.substr(b, e - b), err);
+    CHECK(f && calledNames(*f) == (std::set<std::string>{"Weight", "Helper", "Get"}));
+    auto regions = inlineCallees((dir / "src/main.cpp").string(), b, e, *f, {}, 10);
+    std::vector<std::string> got;
+    for (auto& r : regions) got.push_back(r.name + "@" + std::filesystem::path(r.file).filename().string());
+    // Weight(x) and Weight(x, y) fit the calls, Weight(x, y, z) doesn't;
+    // the first of each name comes before the second Weight
+    CHECK(got == (std::vector<std::string>{"Weight@a.hpp", "Helper@main.cpp", "Get@a.hpp", "Weight@a.hpp"}));
+    CHECK(inlineCallees((dir / "src/main.cpp").string(), b, e, *f, {}, 2).size() == 2);
+
+    // splicing two regions of one file
+    Region r1{"x", 0, 3, "a"}, r2{"x", 6, 9, "b"};
+    std::string t1 = "AAA", t2 = "BBBB";
+    CHECK(spliceRegions("abc---def---", {{&r2, &t2}, {&r1, &t1}}) == "AAA---BBBB---");
+
+    // a source tree made of symlinks, as the integration tests and users build
+    // it: the mirror must use the edited file the symlink tree holds, not
+    // resolve back to where the other symlinks point
+    fs::create_directories(dir / "links");
+    for (auto& entry : fs::directory_iterator(dir / "src"))
+        fs::create_symlink(entry.path(), dir / "links" / entry.path().filename());
+    fs::remove(dir / "links/a.hpp");
+    writeTo(dir / "links/a.hpp", "// edited\n");
+    Mirror m;
+    CHECK(m.create((dir / "links").string(), (dir / "mirror").string(), {(dir / "links/main.cpp").string()}, err));
+    CHECK(readFrom(m.map((dir / "links/a.hpp").string())) == "// edited\n");
+    CHECK(!fs::is_symlink(m.map((dir / "links/main.cpp").string())));
+    CHECK(fs::is_symlink(dir / "mirror/sub"));
+    // a changed file in a subdirectory turns that directory into a real one
+    Mirror m2;
+    CHECK(m2.create((dir / "src").string(), (dir / "mirror2").string(), {(dir / "src/sub/b.hpp").string()}, err));
+    CHECK(!fs::is_symlink(dir / "mirror2/sub") && !fs::is_symlink(dir / "mirror2/sub/b.hpp"));
+    CHECK(!m2.create((dir / "src/sub").string(), (dir / "mirror3").string(), {(dir / "src/main.cpp").string()}, err));
+    fs::remove_all(dir);
+}
+
 int main() {
+    testListDefinitions();
+    testWorkspace();
+    testBoolReturn();
+    testTernaryArg();
+    testSwitchIf();
+    testEarlyReturn();
+    testBranchDup();
+    testCondSplit();
+    testExplicitCompare();
+    testNegateConst();
+    testLoopForm();
+    testReassociate();
     testPassGroups();
     testLexerRoundTrip();
     testLocate();

@@ -14,8 +14,10 @@ add_library(permuter_core STATIC
     src/parser.cpp
     src/analysis.cpp
     src/passes.cpp
+    src/passes_control.cpp
     src/scorer.cpp
     src/runner.cpp
+    src/workspace.cpp
 )
 target_include_directories(permuter_core PUBLIC src)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -29,15 +31,17 @@ enable_testing()
 add_executable(permuter_tests tests/tests.cpp)
 target_link_libraries(permuter_tests PRIVATE permuter_core Threads::Threads)
 add_test(NAME unit COMMAND permuter_tests)
-foreach(suite integration vc6)
+# integration: clang stand-in, runs anywhere clang and llvm-objdump are
+# installed. gta2_parse and vc6 need GTA2_RE (and wine for vc6). Exit code 77
+# means "skipped": the tools or the checkout aren't available here.
+foreach(suite integration gta2_parse vc6)
     if(suite STREQUAL "integration")
         set(script run.sh)
     else()
-        set(script vc6.sh)
+        set(script ${suite}.sh)
     endif()
     add_test(NAME ${suite}
              COMMAND ${CMAKE_COMMAND} -E env PERMUTER=$<TARGET_FILE:cpp_permuter>
                      sh ${CMAKE_SOURCE_DIR}/tests/integration/${script})
-    # 77: the compiler isn't available here
     set_tests_properties(${suite} PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()

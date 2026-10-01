@@ -75,6 +75,17 @@ struct Func {
 bool locateFunction(const std::string& src, const std::string& qualName, size_t& start,
                     size_t& end, std::string& err);
 
+// Byte ranges of every definition (with a body) of qualName in src.
+std::vector<std::pair<size_t, size_t>> findDefinitions(const std::string& src,
+                                                       const std::string& qualName);
+
+struct Definition {
+    std::string name; // as written, e.g. "Ped::GetX" or "GetX" inside a class
+    size_t start, end;
+};
+// Every function definition in src (not nested in another function's body).
+std::vector<Definition> listDefinitions(const std::string& src);
+
 // Parses the text produced by locateFunction. Returns null and sets err on failure.
 std::unique_ptr<Func> parseFunc(const std::string& text, std::string& err);
 
