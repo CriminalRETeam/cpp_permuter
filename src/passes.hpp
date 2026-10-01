@@ -30,6 +30,29 @@ const Pass* findPass(const std::string& name);
 // One random mutation of f by pass p. Returns false if p has nothing to offer.
 bool randomMutation(const Pass& p, const Func& f, Rng& rng, std::string& out);
 
+// A pass, or a combination of passes written "a+b+c" on the command line.
+struct PassGroup {
+    std::vector<const Pass*> passes;
+    std::string name() const;
+    int weight() const;
+};
+
+// Parses pass specs such as {"reorder_saves,invert_if", "swap_operands+flip_compare"}:
+// commas separate groups, '+' combines passes into one group, "all" adds every
+// pass as its own group. No specs means "all".
+bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup>& out,
+                    std::string& err);
+
+// Every distinct text made by applying one mutation of each pass in some
+// non-empty, in-order subset of g's passes (for "a+b": a, b, and a then b).
+// emit returns false to stop.
+void enumerateGroup(const PassGroup& g, const std::string& text,
+                    const std::function<bool(const std::string&)>& emit);
+
+// One random mutation from each of g's passes, in order. Passes with nothing to
+// offer are skipped. Returns false if nothing changed.
+bool randomGroupMutation(const PassGroup& g, const std::string& text, Rng& rng, std::string& out);
+
 // Token-range rewriting of a function.
 class Rewriter {
 public:

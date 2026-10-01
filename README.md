@@ -24,7 +24,7 @@ Needs CMake 3.16+ and a C++17 compiler. Scoring also needs `llvm-objdump` on `PA
 ```sh
 cmake -S . -B build -G Ninja      # or leave out -G for make
 cmake --build build
-ctest --test-dir build            # unit tests, plus end-to-end tests with clang
+ctest --test-dir build            # unit and integration tests (see Tests below)
 ```
 
 ## Usage
@@ -45,9 +45,9 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--symbol`, `--target-symbol` | symbol names, if the guess from `--function` is wrong (MSVC `?Name@Class@@...`, Itanium, or C) |
 | `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output |
 | `--ignore-reloc-names` | compare relocated operands without their symbol names, and treat absolute addresses as symbols. Use this when the target came from raw exe asm |
-| `-m exhaustive` | try every candidate the selected passes produce. `--depth N` chains N mutations, `--max-candidates` caps the count |
-| `-m random` | (default) apply 1..`--max-mutations` random mutations, starting from the base or from the best so far. Runs until a match, `-n` compiles, or Ctrl-C |
-| `-p a,b` | passes to use (default: all) |
+| `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count |
+| `-m random` | (default) apply 1..`--max-mutations` random passes or combos, starting from the base or from the best so far. Runs until a match, `-n` compiles, or Ctrl-C |
+| `-p a,b` | passes to use (default: all). `-p` can be repeated. `a+b` combines passes, see below |
 | `-j N` | parallel compiles |
 | `--dry-run` | print the candidates as diffs without compiling. A quick check of what a pass would do |
 | `--show-ast` | print how the function was parsed |
@@ -67,6 +67,23 @@ The exit status is 0 if a match was found and 3 if not.
 Candidate sources are written next to the original (`PedGroup.permuter0.cpp`, ...) so relative
 `#include`s still resolve. They are deleted on exit. `--candidate-dir` puts them somewhere
 else.
+
+## Combining passes
+
+A function is often off in more than one way: the saves are in the wrong order *and* an `if`
+is the wrong way round. A single pass can't fix both, so passes can be combined:
+
+```sh
+-p reorder_saves,invert_if         # each pass on its own: 23 + 4 candidates
+-p reorder_saves+invert_if         # a combo: 23 + 4 + 23*4 = 119 candidates
+-p reorder_saves -p invert_if+swap_operands   # -p can be repeated
+```
+
+In exhaustive mode, a combo `a+b+c` tries every variant of every pass in it, and every
+in-order chain of them: a, b, c, a then b, a then c, b then c, and a then b then c. In random
+mode a combo applies one mutation from each of its passes. `--depth N` chains whole passes or
+combos too: `-p reorder_saves -p invert_if --depth 2` reaches the same candidates as the combo
+above, plus each pass applied twice.
 
 ## Passes
 
@@ -117,6 +134,31 @@ comparing:
 Target and candidate are then aligned with an edit distance. Penalties: 10 for a register
 difference, 50 for other operand differences, 60 for a moved instruction, 100 for an insertion
 or a deletion. The weights are the same idea as decomp-permuter's.
+
+## Tests
+
+`ctest --test-dir build` runs three suites:
+
+- `unit` (`tests/tests.cpp`): the lexer, parser, effects, each pass, pass combos, and the
+  scorer.
+- `integration` (`tests/integration/run.sh`): each case directory has a `base.cpp` that is
+  wrong in some way and the `target.cpp` that the target object is built from. The permuter
+  must match the target, and where it should, give back exactly `target.cpp`. Negative controls
+  run the wrong passes and must *not* match, which shows the match comes from the pass under
+  test. The cases are:
+  - `var_reorder`: local saves out of order;
+  - `combo`: saves out of order plus an inverted `if`. Single passes fail and the combo
+    matches;
+  - `inline_local`: a local the original didn't have;
+  - `ops`: swapped operands.
+
+  The compiler is clang's i686 MSVC target at `-O0`, where statement order shows up directly in
+  the code.
+- `vc6` (`tests/integration/vc6.sh`): the same proof with the real MSVC 6 under wine, on
+  gta2_re's `PedGroup::PromoteMemberToLeader_4C9680`. That function already matches, so VC6's
+  code for it is the original game's code. The test scrambles the four weapon saves (and
+  inverts an `if`) and checks that the permuter recovers the exact original source. It needs
+  `GTA2_RE` set and wine installed, and is skipped otherwise.
 
 ## gta2_re
 

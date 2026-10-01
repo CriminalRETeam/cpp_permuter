@@ -29,6 +29,15 @@ enable_testing()
 add_executable(permuter_tests tests/tests.cpp)
 target_link_libraries(permuter_tests PRIVATE permuter_core Threads::Threads)
 add_test(NAME unit COMMAND permuter_tests)
-add_test(NAME end_to_end
-         COMMAND ${CMAKE_COMMAND} -E env PERMUTER=$<TARGET_FILE:cpp_permuter>
-                 sh ${CMAKE_SOURCE_DIR}/tests/e2e/run.sh)
+foreach(suite integration vc6)
+    if(suite STREQUAL "integration")
+        set(script run.sh)
+    else()
+        set(script vc6.sh)
+    endif()
+    add_test(NAME ${suite}
+             COMMAND ${CMAKE_COMMAND} -E env PERMUTER=$<TARGET_FILE:cpp_permuter>
+                     sh ${CMAKE_SOURCE_DIR}/tests/integration/${script})
+    # 77: the compiler isn't available here
+    set_tests_properties(${suite} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()

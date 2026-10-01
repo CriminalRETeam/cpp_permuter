@@ -305,7 +305,52 @@ Disassembly of section .text:
     CHECK(guessSymbol(syms, "cfunc") == "_cfunc");
 }
 
+static void testPassGroups() {
+    std::vector<PassGroup> g;
+    std::string err;
+    CHECK(parsePassSpecs({}, g, err) && g.size() == allPasses().size());
+    CHECK(parsePassSpecs({"reorder_saves,invert_if", "swap_operands+flip_compare"}, g, err));
+    CHECK(g.size() == 3 && g[2].passes.size() == 2 && g[2].name() == "swap_operands+flip_compare");
+    CHECK(!parsePassSpecs({"reorder_saves+nope"}, g, err) && contains(err, "nope"));
+
+    std::string src = R"(
+void G::f(u8 idx)
+{
+    W* a = leader->w1;
+    W* b = list[idx]->w1;
+    W* c = leader->w2;
+    t->Copy(leader);
+    if (idx < 3) x(); else y();
+}
+)";
+    size_t b, e;
+    CHECK(locateFunction(src, "G::f", b, e, err));
+    std::string text = src.substr(b, e - b);
+    parsePassSpecs({"reorder_saves+invert_if"}, g, err);
+    std::set<std::string> combos;
+    enumerateGroup(g[0], text, [&](const std::string& s) {
+        combos.insert(s);
+        return true;
+    });
+    // 5 new orders, 1 inversion, and each order with the inversion
+    CHECK(combos.size() == 5 + 1 + 5 * 1);
+    bool both = false;
+    for (auto& s : combos)
+        both |= s.find("W* c") < s.find("W* a") && contains(s, "if (idx >= 3) y(); else x();");
+    CHECK(both);
+    // stopping early
+    int n = 0;
+    enumerateGroup(g[0], text, [&](const std::string&) { return ++n < 3; });
+    CHECK(n == 3);
+
+    Rng rng(7);
+    std::string out;
+    CHECK(randomGroupMutation(g[0], text, rng, out) && out != text);
+    CHECK(contains(out, "if (idx >= 3)")); // invert_if always has something to do
+}
+
 int main() {
+    testPassGroups();
     testLexerRoundTrip();
     testLocate();
     testParser();

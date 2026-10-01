@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <numeric>
+#include <set>
+#include <sstream>
 
 namespace perm {
 
@@ -390,16 +392,30 @@ void enumInlineLocal(const Func& f, const EmitFn& emit) {
         if (inLoop && !trivially) continue;
 
         auto x = parseExpr(f, d.initBegin, d.initEnd);
-        bool needParen = !x || !isPostfixLike(*x);
-        std::string plain = needParen ? paren(init) : init;
+        bool postfixLike = x && isPostfixLike(*x);
+        bool commaFree = x && x->k != Expr::Comma;
+        // A use that is a whole operand on its own (an assignment's right side,
+        // an argument, a return value, an index) needs no parentheses.
+        auto standalone = [&](int u) {
+            const std::string& p = f.t(u - 1);
+            const std::string& n = f.t(u + 1);
+            bool before = isAssignOp(p) || p == "(" || p == "," || p == "return" || p == "[";
+            bool after = n == ";" || n == ")" || n == "," || n == "]";
+            return before && after && commaFree;
+        };
         std::string castT = declTypeText(f, *s) + f.tokText(d.begin, d.nameTok);
-        std::vector<std::string> variants = {plain};
-        if (uses.size() == 1 && !d.isRef && !s->isConst) variants.push_back("((" + castT + ")" + paren(init) + ")");
-        for (auto& v : variants) {
-            if (!emit([&f, s, uses, v]() {
+        std::vector<int> casts = {0};
+        if (uses.size() == 1 && !d.isRef && !s->isConst) casts.push_back(1);
+        for (int cast : casts) {
+            std::vector<std::string> texts;
+            for (int u : uses) {
+                if (cast) texts.push_back("((" + castT + ")" + paren(init) + ")");
+                else texts.push_back(postfixLike || standalone(u) ? init : paren(init));
+            }
+            if (!emit([&f, s, uses, texts]() {
                     Rewriter rw(f);
                     rw.remove(s->begin, s->end);
-                    for (int u : uses) rw.replace(u, u + 1, v);
+                    for (size_t k = 0; k < uses.size(); ++k) rw.replace(uses[k], uses[k] + 1, texts[k]);
                     return rw.apply();
                 }))
                 return;
@@ -870,6 +886,104 @@ bool randomMutation(const Pass& p, const Func& f, Rng& rng, std::string& out) {
     if (!chosen) return false;
     out = chosen();
     return !out.empty();
+}
+
+// ---------------------------------------------------------------------------
+// pass groups
+
+std::string PassGroup::name() const {
+    std::string r;
+    for (auto* p : passes) r += (r.empty() ? "" : "+") + p->name;
+    return r;
+}
+
+int PassGroup::weight() const {
+    int w = 0;
+    for (auto* p : passes) w = std::max(w, p->weight);
+    return w;
+}
+
+bool parsePassSpecs(const std::vector<std::string>& specs, std::vector<PassGroup>& out,
+                    std::string& err) {
+    out.clear();
+    auto addAll = [&]() {
+        for (auto& p : allPasses()) out.push_back({{&p}});
+    };
+    if (specs.empty()) {
+        addAll();
+        return true;
+    }
+    for (auto& spec : specs) {
+        std::stringstream groups(spec);
+        std::string g;
+        while (std::getline(groups, g, ',')) {
+            g.erase(std::remove(g.begin(), g.end(), ' '), g.end());
+            if (g.empty()) continue;
+            if (g == "all") {
+                addAll();
+                continue;
+            }
+            PassGroup grp;
+            std::stringstream names(g);
+            std::string n;
+            while (std::getline(names, n, '+')) {
+                const Pass* p = findPass(n);
+                if (!p) {
+                    err = "unknown pass '" + n + "' (see --list-passes)";
+                    return false;
+                }
+                grp.passes.push_back(p);
+            }
+            if (!grp.passes.empty()) out.push_back(grp);
+        }
+    }
+    if (out.empty()) {
+        err = "no passes given";
+        return false;
+    }
+    return true;
+}
+
+void enumerateGroup(const PassGroup& g, const std::string& text,
+                    const std::function<bool(const std::string&)>& emit) {
+    std::set<std::string> seen = {text};
+    bool stop = false;
+    std::function<void(const std::string&, size_t)> rec = [&](const std::string& cur, size_t from) {
+        for (size_t j = from; j < g.passes.size() && !stop; ++j) {
+            std::string err;
+            auto f = parseFunc(cur, err);
+            if (!f) return;
+            std::vector<std::string> outs;
+            g.passes[j]->enumerate(*f, [&](Mutation m) {
+                std::string s = m();
+                if (!s.empty() && seen.insert(s).second) outs.push_back(std::move(s));
+                return true;
+            });
+            for (auto& s : outs) {
+                if (stop) return;
+                if (!emit(s)) {
+                    stop = true;
+                    return;
+                }
+                rec(s, j + 1);
+            }
+        }
+    };
+    rec(text, 0);
+}
+
+bool randomGroupMutation(const PassGroup& g, const std::string& text, Rng& rng, std::string& out) {
+    std::string cur = text;
+    for (auto* p : g.passes) {
+        std::string err;
+        auto f = parseFunc(cur, err);
+        if (!f) break;
+        std::string next;
+        if (randomMutation(*p, *f, rng, next) && next != cur) cur = next;
+    }
+    if (cur == text) return false;
+    out = cur;
+    return true;
 }
 
 } // namespace perm

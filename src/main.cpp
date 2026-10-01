@@ -51,11 +51,13 @@ Scoring:
 
 Search:
   -m, --mode MODE           random (default) or exhaustive
-  -p, --passes LIST         comma separated passes (default: all). See --list-passes
-      --depth N             exhaustive: apply up to N mutations in a row (default 1)
+  -p, --passes LIST         passes to use (default: all), see --list-passes. Commas
+                            separate passes, '+' combines them: "a+b" tries a, b and
+                            a then b. Can be given more than once
+      --depth N             exhaustive: chain up to N passes/combos (default 1)
       --max-candidates N    exhaustive: stop after N candidates (default 200000)
   -n, --iterations N        random: stop after N compiles (default: run until match/Ctrl-C)
-      --max-mutations N     random: up to N mutations per candidate (default 3)
+      --max-mutations N     random: up to N passes/combos per candidate (default 3)
       --seed N              random seed
       --keep-going          don't stop at the first exact match
   -j, --jobs N              parallel compiles (default 1)
@@ -96,21 +98,6 @@ struct Options {
 std::atomic<bool> gStop{false};
 
 void onSignal(int) { gStop = true; }
-
-std::vector<std::string> split(const std::string& s, char sep) {
-    std::vector<std::string> r;
-    std::string cur;
-    for (char c : s) {
-        if (c == sep) {
-            if (!cur.empty()) r.push_back(cur);
-            cur.clear();
-        } else if (c != ' ') {
-            cur += c;
-        }
-    }
-    if (!cur.empty()) r.push_back(cur);
-    return r;
-}
 
 bool readFile(const std::string& path, std::string& out) {
     std::ifstream in(path, std::ios::binary);
@@ -154,7 +141,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "objdump") return need() && (o.objdump = val, true);
     if (key == "ignore-reloc-names") return o.ignoreRelocNames = true;
     if (key == "mode" || key == "m") return need() && (o.mode = val, true);
-    if (key == "passes" || key == "p") return need() && (o.passes = split(val, ','), true);
+    if (key == "passes" || key == "p") return need() && (o.passes.push_back(val), true);
     if (key == "depth") return num(o.depth);
     if (key == "max-candidates") return num(o.maxCandidates);
     if (key == "iterations" || key == "n") return num(o.iterations);
@@ -416,46 +403,26 @@ void printStatus(State& st) {
               << std::flush;
 }
 
-std::vector<const Pass*> pickPasses(const Options& o, std::string& err) {
-    std::vector<const Pass*> r;
-    if (o.passes.empty()) {
-        for (auto& p : allPasses()) r.push_back(&p);
-        return r;
-    }
-    for (auto& n : o.passes) {
-        const Pass* p = findPass(n);
-        if (!p) {
-            err = "unknown pass '" + n + "' (see --list-passes)";
-            return {};
-        }
-        r.push_back(p);
-    }
-    return r;
-}
-
 // One random candidate derived from start; empty if nothing applied.
-std::string randomCandidate(const Options& o, const std::vector<const Pass*>& passes,
+std::string randomCandidate(const Options& o, const std::vector<PassGroup>& groups,
                             const std::string& start, Rng& rng) {
     int total = 0;
-    for (auto* p : passes) total += p->weight;
+    for (auto& g : groups) total += g.weight();
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
     std::string text = start;
     for (int m = 0; m < k; ++m) {
-        std::string err;
-        auto f = parseFunc(text, err);
-        if (!f) break;
         for (int attempt = 0; attempt < 10; ++attempt) {
             int r = std::uniform_int_distribution<int>(0, total - 1)(rng);
-            const Pass* p = passes.back();
-            for (auto* q : passes) {
-                if (r < q->weight) {
-                    p = q;
+            const PassGroup* g = &groups.back();
+            for (auto& q : groups) {
+                if (r < q.weight()) {
+                    g = &q;
                     break;
                 }
-                r -= q->weight;
+                r -= q.weight();
             }
             std::string out;
-            if (randomMutation(*p, *f, rng, out) && out != text) {
+            if (randomGroupMutation(*g, text, rng, out)) {
                 text = out;
                 break;
             }
@@ -465,7 +432,7 @@ std::string randomCandidate(const Options& o, const std::vector<const Pass*>& pa
 }
 
 int runRandom(const Options& o, const Evaluator& ev, State& st,
-              const std::vector<const Pass*>& passes) {
+              const std::vector<PassGroup>& groups) {
     unsigned long long seed = o.seedSet ? o.seed : (unsigned long long)std::random_device{}();
     std::vector<std::thread> workers;
     std::atomic<int> idle{0};
@@ -482,7 +449,7 @@ int runRandom(const Options& o, const Evaluator& ev, State& st,
                                     std::uniform_int_distribution<int>(0, 1)(rng) == 0;
                     start = fromBest ? st.bestText : st.baseText;
                 }
-                std::string cand = randomCandidate(o, passes, start, rng);
+                std::string cand = randomCandidate(o, groups, start, rng);
                 bool fresh = false;
                 if (!cand.empty()) {
                     std::lock_guard<std::mutex> lk(st.mu);
@@ -511,7 +478,7 @@ int runRandom(const Options& o, const Evaluator& ev, State& st,
 }
 
 int runExhaustive(const Options& o, const Evaluator& ev, State& st,
-                  const std::vector<const Pass*>& passes) {
+                  const std::vector<PassGroup>& groups) {
     std::mutex qmu;
     std::condition_variable qcv;
     std::deque<std::string> queue;
@@ -546,14 +513,10 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st,
         for (int d = 1; d <= o.depth && !gStop; ++d) {
             std::vector<std::string> next;
             for (auto& text : level) {
-                std::string err;
-                auto f = parseFunc(text, err);
-                if (!f) continue;
-                for (auto* p : passes) {
-                    p->enumerate(*f, [&](Mutation m) {
+                for (auto& g : groups) {
+                    if (gStop || produced >= o.maxCandidates) break;
+                    enumerateGroup(g, text, [&](const std::string& s) {
                         if (gStop || produced >= o.maxCandidates) return false;
-                        std::string s = m();
-                        if (s.empty()) return true;
                         {
                             std::lock_guard<std::mutex> lk(st.mu);
                             if (!st.seen.insert(hashText(s)).second) return true;
@@ -562,7 +525,7 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st,
                         if (d < o.depth) next.push_back(s);
                         std::unique_lock<std::mutex> lk(qmu);
                         qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
-                        queue.push_back(std::move(s));
+                        queue.push_back(s);
                         qcv.notify_all();
                         return true;
                     });
@@ -599,22 +562,19 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st,
     return 0;
 }
 
-int dryRun(const Options& o, const std::string& base, const std::vector<const Pass*>& passes) {
-    std::string err;
-    auto f = parseFunc(base, err);
+int dryRun(const Options& o, const std::string& base, const std::vector<PassGroup>& groups) {
     if (o.mode == "exhaustive") {
         long count = 0;
         std::unordered_set<size_t> seen;
-        for (auto* p : passes) {
+        for (auto& g : groups) {
             long mine = 0;
-            p->enumerate(*f, [&](Mutation m) {
-                std::string s = m();
-                if (s.empty() || !seen.insert(hashText(s)).second) return true;
+            enumerateGroup(g, base, [&](const std::string& s) {
+                if (!seen.insert(hashText(s)).second) return true;
                 mine++;
-                if (++count <= 50) std::cout << "=== " << p->name << " #" << mine << "\n" << lineDiff(base, s);
+                if (++count <= 50) std::cout << "=== " << g.name() << " #" << mine << "\n" << lineDiff(base, s);
                 return count < o.maxCandidates;
             });
-            std::cerr << p->name << ": " << mine << " candidates\n";
+            std::cerr << g.name() << ": " << mine << " candidates\n";
         }
         std::cerr << count << " candidates in total\n";
         return 0;
@@ -622,7 +582,7 @@ int dryRun(const Options& o, const std::string& base, const std::vector<const Pa
     Rng rng(o.seedSet ? o.seed : 1);
     long n = o.iterations ? o.iterations : 10;
     for (long i = 0; i < n; ++i) {
-        std::string s = randomCandidate(o, passes, base, rng);
+        std::string s = randomCandidate(o, groups, base, rng);
         std::cout << "=== random #" << i + 1 << "\n" << (s.empty() ? "(no change)\n" : lineDiff(base, s));
     }
     return 0;
@@ -671,8 +631,8 @@ int main(int argc, char** argv) {
         std::cout << "\n";
         return 0;
     }
-    auto passes = pickPasses(o, err);
-    if (passes.empty()) {
+    std::vector<PassGroup> groups;
+    if (!parsePassSpecs(o.passes, groups, err)) {
         std::cerr << "error: " << err << "\n";
         return 2;
     }
@@ -680,7 +640,7 @@ int main(int argc, char** argv) {
         std::cerr << "error: --mode must be random or exhaustive\n";
         return 2;
     }
-    if (o.dryRun) return dryRun(o, funcText, passes);
+    if (o.dryRun) return dryRun(o, funcText, groups);
 
     if (o.compile.empty() || (o.targetObj.empty() && o.scoreCmd.empty())) {
         std::cerr << "error: --compile and --target-obj (or --score-cmd) are required\n";
@@ -753,8 +713,8 @@ int main(int argc, char** argv) {
         cleanup();
         return 0;
     }
-    if (o.mode == "random") runRandom(o, ev, st, passes);
-    else runExhaustive(o, ev, st, passes);
+    if (o.mode == "random") runRandom(o, ev, st, groups);
+    else runExhaustive(o, ev, st, groups);
     cleanup();
 
     std::cout << "\n";

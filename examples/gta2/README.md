@@ -52,6 +52,9 @@ Suggestions:
 
 - When you already suspect the kind of fix, use exhaustive mode with just that pass:
   `-m exhaustive -p reorder_saves` tries every order of every run of local saves.
+- When it's off in two ways at once, combine the passes: `-p reorder_saves+invert_if` tries
+  each pass alone and every pair of their variants. `-p` can be repeated to run several
+  combos in one go.
 - `--dry-run` shows what a pass would produce without compiling anything.
 - Random mode (the default) mixes all passes and is good for leaving running. Add
   `-p reorder_saves,move_stmt` and similar to focus it.
