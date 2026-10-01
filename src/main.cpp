@@ -51,7 +51,8 @@ Scoring:
                             (default: guessed from --function)
       --target-symbol SYM   symbol in the target object (default: same as --symbol)
       --score-cmd CMD       score with this command instead ({obj}, {src}); it must
-                            print the score (lower is better, 0 = match) as its last number
+                            print the score (lower is better, 0 = match) as its last number.
+                            Its output is kept as score_output.txt with each improvement
       --objdump PATH        llvm-objdump to use (default: llvm-objdump)
       --ignore-reloc-names  compare relocated operands without their symbol names
                             (for targets built from raw executable asm)
@@ -78,6 +79,9 @@ Other functions (for helpers VC6 inlines into the target):
       --also [FILE:]NAME    also permute this function. FILE is relative to the current
                             directory or the source's; without it NAME is looked up in
                             the source and the headers it includes. Repeatable
+      --op-alias OP=NAME    for named_op: operator OP ("*", "+", ..., "neg" for unary
+                            minus) also exists as the method NAME, e.g.
+                            "*=Multiply_408680". Repeatable
       --inline-callees      also permute the inline functions the target calls: their
                             definitions in the source (if marked inline) and in the
                             headers it includes
@@ -131,7 +135,7 @@ struct Options {
     int jobs = 1;
     int timeout = 120;
     std::string outputDir = "permuter_out";
-    std::vector<std::string> also, includeDirs, checkParse;
+    std::vector<std::string> also, includeDirs, checkParse, opAliases;
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
     int maxCallees = 8;
@@ -211,6 +215,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "timeout") return num(o.timeout);
     if (key == "output-dir" || key == "o") return need() && (o.outputDir = val, true);
     if (key == "also") return need() && (o.also.push_back(val), true);
+    if (key == "op-alias") return need() && (o.opAliases.push_back(val), true);
     if (key == "inline-callees") return o.inlineCallees = true;
     if (key == "max-callees") return num(o.maxCallees);
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
@@ -470,10 +475,8 @@ struct Evaluator {
             CmdResult r = runCommand(expandTemplate(o.scoreCmd, {{"obj", obj}, {"src", srcPath(w)}}), o.timeout);
             bool ok;
             double v = lastNumber(r.output, ok);
-            if (r.status != 0 || !ok) {
-                log = r.output;
-                return -1;
-            }
+            log = r.output; // on success it goes to score_output.txt (e.g. an asm diff)
+            if (r.status != 0 || !ok) return -1;
             return (long)(v + 0.5);
         }
         std::vector<Insn> mine;
@@ -509,7 +512,7 @@ std::string candDiff(const Workspace& ws, const Cand& c) {
 }
 
 void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
-                 const std::vector<Insn>& insns) {
+                 const std::vector<Insn>& insns, const std::string& scoreOutput) {
     const Workspace& ws = ev.ws;
     std::string dir = (fs::path(o.outputDir) / ("output-" + std::to_string(score) + "-" +
                                                 std::to_string(++st.outputs)))
@@ -531,6 +534,7 @@ void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c
     writeFile(dir + "/diff.txt", diff);
     if (!insns.empty()) writeFile(dir + "/asm_diff.txt", diffInsns(ev.sc, ev.target, insns));
     writeFile(dir + "/score.txt", std::to_string(score) + "\n");
+    if (!o.scoreCmd.empty()) writeFile(dir + "/score_output.txt", scoreOutput);
     std::cout << "\n[" << score << "] " << (score < st.bestScore ? "new best (was " + std::to_string(st.bestScore) + ")" : std::string("tie"))
               << ", written to " << dir
               << "\n"
@@ -549,13 +553,13 @@ bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, lon
     }
     bool wanted = o.onlyBelow < 0 || score < o.onlyBelow;
     if (score < st.bestScore) {
-        if (wanted) writeOutput(o, ev, st, c, score, insns);
+        if (wanted) writeOutput(o, ev, st, c, score, insns, log);
         st.bestScore = score;
         st.best = c;
         st.improvements++;
     } else if (o.keepTies && score == st.bestScore && score < st.baseScore && wanted && st.ties < 200) {
         st.ties++;
-        writeOutput(o, ev, st, c, score, insns);
+        writeOutput(o, ev, st, c, score, insns, log);
     }
     return score == 0 && !o.keepGoing;
 }
@@ -1076,6 +1080,19 @@ int main(int argc, char** argv) {
                 for (auto& g : findGetters(text)) gs.push_back(g);
         }
         setGetters(gs);
+    }
+    // operators with named out-of-line versions, for named_op
+    {
+        std::vector<OpAlias> as;
+        for (auto& spec : o.opAliases) {
+            size_t eq = spec.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 == spec.size()) {
+                std::cerr << "error: --op-alias " << spec << ": expected OP=NAME\n";
+                return 1;
+            }
+            as.push_back({spec.substr(0, eq), spec.substr(eq + 1)});
+        }
+        setOpAliases(as);
     }
     if (o.listRegions || ws.regions.size() > 1) {
         std::cout << "permuting:\n";

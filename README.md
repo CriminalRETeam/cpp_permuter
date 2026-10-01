@@ -66,7 +66,8 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `-c/--compile` | compile command. `{src}` is the candidate source, `{obj}` the object it must write, `{dir}` the candidate's directory, `{root}` the mirror's root (see below) |
 | `-t/--target-obj` | object file holding the target code |
 | `--symbol`, `--target-symbol` | symbol names, if the guess from `--function` is wrong (MSVC `?Name@Class@@...`, Itanium, or C) |
-| `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output |
+| `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output. The output is kept as `score_output.txt` with each improvement, so a scorer can print its own asm diff |
+| `--op-alias OP=NAME` | for `named_op`: operator `OP` (`*`, `+`, ..., `neg`) also exists as the method `NAME`. Repeatable |
 | `--ignore-reloc-names` | compare relocated operands without their symbol names, and treat absolute addresses as symbols. Use this when the target came from raw exe asm |
 | `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count |
 | `-m random` | (default) apply 1..`--max-mutations` random passes or combos, starting from the base or from the best so far. Runs until a match, `-n` compiles, or Ctrl-C |
@@ -95,6 +96,7 @@ Each improvement goes to `permuter_out/output-<score>-<n>/`:
 - `<header>.hpp`: each header that changed, when helpers were permuted.
 - `diff.txt`: what changed.
 - `asm_diff.txt`: target and candidate asm aligned side by side.
+- `score_output.txt`: with `--score-cmd`, what the score command printed.
 
 The exit status is 0 if a match was found and 3 if not.
 
@@ -223,6 +225,8 @@ on an example function**, generated from the passes themselves
 | `split_case_labels` | `case 1: case 2: S` and `case 1: S case 2: S`, both ways (one jump table entry per case vs a byte index table) |
 | `use_getter` | `p->field_1AC_cam.x` and `p->get_cam_x()`, both ways, using the inline getters found in the source and the headers it includes |
 | `temp_for_expr` | Compute a cast, a local or `*p` into a new local first (`u8 tmp = (u8)p->a; g(tmp);`). Types come from the declarations; also "copy through a local to get a spill" |
+| `named_op` | `a * b` and `a.Multiply_408680(b)`, `-a` and `a.Negate_4086A0()`, both ways, for the operators given with `--op-alias OP=NAME` (`neg` for unary minus). Calling the named out-of-line version decides whether VC6 inlines that use of the operator, which also changes what else it inlines (the inline budget) |
+| `cast_operand` | Cast an operand of `/ % >> < > <= >= + - * == !=` to `u32`, `s32`, `u16`, `s16`, `u8` or `s8`, or drop or change an integer cast there: `div` vs `idiv`, `shr` vs `sar`, `jb` vs `jl`, byte adds. Operands that are non-integer locals or calls are left alone |
 | `remove_stmt` | Remove an expression statement (low weight) |
 
 decomp-permuter passes left out because they rely on IDO behaviour that VC6 `/O2` folds

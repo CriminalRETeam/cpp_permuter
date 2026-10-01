@@ -39,6 +39,15 @@ std::vector<Getter> findGetters(const std::string& text);
 void setGetters(std::vector<Getter> g); // before the passes run
 const std::vector<Getter>& getters();
 
+// An operator that also exists as a named (out-of-line) method: "*" -> "Multiply_408680",
+// "neg" (unary minus) -> "Negate_4086A0". named_op swaps between the two, which decides
+// whether VC6 inlines it. Set with --op-alias OP=NAME.
+struct OpAlias {
+    std::string op, method;
+};
+void setOpAliases(std::vector<OpAlias> a); // before the passes run
+const std::vector<OpAlias>& opAliases();
+
 // A pass, or a combination of passes written "a+b+c" on the command line.
 struct PassGroup {
     std::vector<const Pass*> passes;
