@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang llvm
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        # unit and clang integration tests; gta2_parse and vc6 need a gta2_re
+        # checkout and wine, and report as skipped
+        run: ctest --test-dir build --output-on-failure
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp_permuter-linux-x64
+          path: |
+            build/cpp_permuter
+            examples/gta2/compile.sh
+            README.md
+            LICENSE
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Tools
+        shell: bash
+        run: |
+          # clang and llvm-objdump come with the runner's LLVM install
+          echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp_permuter-windows-x64
+          path: |
+            build/Release/cpp_permuter.exe
+            examples/gta2/compile.cmd
+            README.md
+            LICENSE

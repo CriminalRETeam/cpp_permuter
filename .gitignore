@@ -1,0 +1,3 @@
+build/
+permuter_out/
+*.permuter[0-9]*.cpp

@@ -1,0 +1,4 @@
+# LF everywhere, also on Windows checkouts: the shell scripts need it, and the
+# unit tests compare docs/passes.md byte for byte.
+* text=auto eol=lf
+*.cmd text eol=crlf
