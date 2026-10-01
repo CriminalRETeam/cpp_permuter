@@ -104,6 +104,14 @@ expect_original() {
     echo "ok:   $LABEL: base $b -> 0, recovered the original source"
 }
 
+# A match, from a base that didn't match (the source may differ from the original).
+expect_match() {
+    [ "$RC" -eq 0 ] || { fail "expected a match, exit $RC"; return; }
+    b=$(tr '\r' '\n' < "$WORK/log_$N" | sed -n 's/^base score: //p')
+    [ -n "$b" ] && [ "$b" -gt 0 ] || { fail "base already matched"; return; }
+    echo "ok:   $LABEL: base $b -> 0"
+}
+
 expect_no_match() {
     [ "$RC" -eq 3 ] && { echo "ok:   $LABEL: no match, as expected"; return; }
     fail "expected 'no match' (exit 3), got exit $RC"
@@ -264,12 +272,54 @@ mutate fix16.hpp <<'EOF'
         return input.mValue > 0 ? input : -input;
 EOF
 FAR=PedGroup::IsMemberTooFarFromLeader_4CAC20
-run "inline callee: Fix16::Abs via --inline-callees" PedGroup.cpp $FAR -m exhaustive -p ternary --inline-callees
+# the early-return form compiles the same as if/else here; with -j 1 the
+# if/else form (tried first) is the one reported, and random may find either
+run "inline callee: Fix16::Abs via --inline-callees" PedGroup.cpp $FAR -m exhaustive -p ternary --inline-callees -j 1
 expect_original fix16.hpp
 run "inline callee: Fix16::Abs, random" PedGroup.cpp $FAR -m random -p ternary,flip_compare,invert_if --inline-callees -n 60
-expect_original fix16.hpp
+expect_match
 run "inline callee: Fix16::Abs, control (calling function only)" PedGroup.cpp $FAR -m exhaustive
 expect_no_match
+
+# --- use_getter: an inline getter call written out as the field it reads ------
+# (matching_quirks.md: getters vs direct field reads change register choice)
+fresh
+mutate PedGroup.cpp <<'EOF'
+    Fix16 y_diff = field_2C_ped_leader->get_cam_y() - pTargetCar->field_50_car_sprite->field_14_xy.y;
+====
+    Fix16 y_diff = field_2C_ped_leader->field_1AC_cam.y - pTargetCar->field_50_car_sprite->field_14_xy.y;
+EOF
+CLOSE=PedGroup::IsLeaderCloseToTargetCar_4CAD40
+# Two sources match here: the original get_cam_y(), and leaving field_1AC_cam.y
+# but reading the car's x through Car_BC::get_x_41E430() instead, which VC6
+# compiles to the same code. Either may be found first, so any match will do.
+run "use_getter: IsLeaderCloseToTargetCar" PedGroup.cpp $CLOSE -m exhaustive -p use_getter
+expect_match
+run "use_getter: control" PedGroup.cpp $CLOSE -m exhaustive -p "$(all_but use_getter)" --max-candidates 400
+expect_no_match
+
+# --- inequalities: the same comparison against the neighbouring constant ------
+fresh
+mutate PedGroup.cpp <<'EOF'
+    if (field_2C_ped_leader->field_168_game_object == NULL || field_2C_ped_leader->get_field_20e() < 0x28)
+====
+    if (field_2C_ped_leader->field_168_game_object == NULL || field_2C_ped_leader->get_field_20e() <= 0x27)
+EOF
+run "inequalities: sub_4C9150" PedGroup.cpp PedGroup::sub_4C9150 -m exhaustive -p inequalities
+expect_original
+run "inequalities: control" PedGroup.cpp PedGroup::sub_4C9150 -m exhaustive -p "$(all_but inequalities)" --max-candidates 400
+expect_no_match
+
+# --- PERM macros: the alternatives written into the function -----------------
+fresh
+printf '%s\n====\n%s\n' "$SAVES" "PERM_LINESWAP(
+$(reordered 3021)
+)" | mutate PedGroup.cpp
+run "PERM_LINESWAP: the four saves" PedGroup.cpp $PROMOTE -m exhaustive
+[ "$RC" -eq 0 ] && grep -q "Weapon_30\* leaderWeapon = field_2C_ped_leader->field_170_selected_weapon;
+    Weapon_30\* memberWeapon = " "$OUT"/output-0-*/source.cpp 2>/dev/null &&
+    echo "ok:   PERM_LINESWAP: the four saves: matched in the original order" ||
+    fail "expected a match in the original order, exit $RC"
 
 # --- candidates VC6 accepts: random mutations from every pass ---------------
 # The parse check (gta2_parse.sh) only shows candidates are well formed; this

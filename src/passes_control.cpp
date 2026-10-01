@@ -8,8 +8,6 @@
 
 namespace perm::util {
 
-namespace {
-
 bool emitReplace(const Func& f, const EmitFn& emit, int b, int e, const std::string& text) {
     return emit([&f, b, e, text]() {
         Rewriter rw(f);
@@ -74,8 +72,8 @@ const Expr* nodeAt(const Expr& x, int b, int e) {
 
 // "{ stmts }" laid out at indentation ind (the brace's own line).
 std::string blockText(const Func& f, const std::vector<const Stmt*>& v, const std::string& ind,
-                      const std::vector<std::string>& extraBefore = {},
-                      const std::vector<std::string>& extraAfter = {}) {
+                      const std::vector<std::string>& extraBefore,
+                      const std::vector<std::string>& extraAfter) {
     std::string in = ind + "    ";
     std::string r = "{";
     for (auto& x : extraBefore) r += "\n" + in + x;
@@ -122,8 +120,6 @@ std::vector<const Stmt*> stmtsOfKind(const Func& f, SK k) {
 }
 
 bool inBlock(const Stmt& s) { return s.parent && s.parent->kind == SK::Block; }
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // bool_return: "return a <= b;" <-> "if (a <= b) return true; return false;"

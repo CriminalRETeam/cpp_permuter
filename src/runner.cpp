@@ -10,7 +10,8 @@
 
 namespace perm {
 
-CmdResult runCommand(const std::string& cmd, int timeoutSec) {
+CmdResult runCommand(const std::string& cmd, int timeoutSec,
+                     const std::map<std::string, std::string>& env) {
     CmdResult r;
     int fds[2];
     if (pipe(fds) != 0) {
@@ -32,6 +33,7 @@ CmdResult runCommand(const std::string& cmd, int timeoutSec) {
         close(fds[1]);
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) dup2(devnull, 0);
+        for (auto& [k, v] : env) setenv(k.c_str(), v.c_str(), 1);
         execl("/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
         _exit(127);
     }

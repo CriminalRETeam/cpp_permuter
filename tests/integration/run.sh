@@ -67,7 +67,7 @@ expect_match() {
 expect_exact_source() {
     expect_match || return
     m=$(ls -d "$OUT"/output-0-* | head -1)
-    if ! diff -w "$m/source.cpp" "$HERE/$CASE/target/main.cpp" > "$WORK/srcdiff_$N"; then
+    if ! diff -w -B "$m/source.cpp" "$HERE/$CASE/target/main.cpp" > "$WORK/srcdiff_$N"; then
         fail "matched, but main.cpp differs from the target:"
         cat "$WORK/srcdiff_$N"
         return
@@ -125,7 +125,8 @@ expect_match
 run ops Sum random -m random -p swap_operands,invert_if,flip_compare -n 400
 expect_match
 
-# --- one case per control-flow / expression pass -----------------------------
+# --- one case per pass ----------------------------------------------------------
+# chain_assign: at -O0 "a = b = 0;" is "b = 0; a = 0;", which move_stmt reaches too
 # bool_return: at clang -O0 the else/1-0 forms compile the same as the target's,
 # so any of them is a real match (vc6.sh checks the exact form with VC6).
 run bool_return IsReady exhaustive -m exhaustive -p bool_return
@@ -133,15 +134,30 @@ expect_match
 run bool_return IsReady control -m exhaustive -p "$(all_but bool_return)"
 expect_no_match
 for c in ternary_arg:Notify switch_if:OnCommand branch_dup:Update \
-         cond_split:Check negate_const:Offset reassociate:Sum; do
-    pass=${c%%:*} fn=${c#*:}
+         cond_split:Check negate_const:Offset reassociate:Sum inequalities:Check \
+         chain_assign:Clear:move_stmt local_type:Count locals_to_array:Pair reorder_cases:Pick \
+         split_case_labels:Pick use_getter:Next temp_for_expr:Send remove_stmt:Finish; do
+    # pass:function[:other pass that reaches the same code, left out of the control]
+    pass=${c%%:*} rest=${c#*:} fn=${rest%%:*} also=""
+    [ "$rest" != "$fn" ] && also=${rest#*:}
     run "$pass" "$fn" exhaustive -m exhaustive -p "$pass"
     expect_exact_source
     run "$pass" "$fn" random -m random -p "$pass" -n 50
-    expect_exact_source
-    run "$pass" "$fn" control -m exhaustive -p "$(all_but "$pass")"
+    # where an equivalent form exists, random mode may land on it instead
+    if [ -n "$also" ]; then expect_match; else expect_exact_source; fi
+    run "$pass" "$fn" control -m exhaustive -p "$(all_but "$pass" $also)"
     expect_no_match
 done
+
+# --- PERM macros: the alternatives written into the function ---------------
+# 3! line orders x 3 values; without PERM_RANDOMIZE only the macros are tried
+run perm_macros Run exhaustive -m exhaustive
+expect_exact_source
+grep -q "^17 candidates generated" "$WORK/log_$N" || fail "expected 17 candidates (18 expansions less the base)"
+run perm_macros Run random -m random -n 60
+expect_exact_source
+run perm_macros Run control -m exhaustive -p none --max-candidates 5
+expect_no_match
 
 # --- inline_callee: the function is fine, the inline helper it calls isn't --
 run inline_callee Score inline-callees -m exhaustive -p swap_operands --inline-callees

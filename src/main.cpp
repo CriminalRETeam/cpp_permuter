@@ -442,7 +442,12 @@ struct Evaluator {
                                                      {"obj", obj},
                                                      {"dir", fs::path(src).parent_path().string()},
                                                      {"root", mirrors[w].dir()}});
-        CmdResult r = runCommand(cmd, o.timeout);
+        // Precompiled headers can't be trusted while headers are being edited:
+        // VC6 checks them by timestamp, and an edit within the same second as
+        // the .pch is missed. Compile scripts honour PERMUTER_NO_PCH.
+        std::map<std::string, std::string> env;
+        if (ws.files.size() > 1) env["PERMUTER_NO_PCH"] = "1";
+        CmdResult r = runCommand(cmd, o.timeout, env);
         gTimes.compile += cw.us();
         log = r.output;
         if (r.timedOut) log += "\n(timed out)";
@@ -1051,6 +1056,18 @@ int main(int argc, char** argv) {
             return 1;
         }
         ws.base.push_back(text);
+    }
+    // inline getters for use_getter: in the source and the headers it includes
+    {
+        std::vector<Getter> gs;
+        std::vector<std::string> files = {srcPath};
+        for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+        for (auto& file : files) {
+            std::string text;
+            if (readFile(file, text))
+                for (auto& g : findGetters(text)) gs.push_back(g);
+        }
+        setGetters(gs);
     }
     if (o.listRegions || ws.regions.size() > 1) {
         std::cout << "permuting:\n";

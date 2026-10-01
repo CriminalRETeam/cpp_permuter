@@ -137,6 +137,9 @@ std::shared_ptr<Node> parse(const std::string& s, bool& has, bool& randomize, st
                 Node::Piece p;
                 p.name = name;
                 p.rawArgs = splitArgs(s.substr(open + 1, k - open - 1));
+                // value-like arguments are trimmed; code blocks keep their layout
+                if (name == "PERM_GENERAL" || name == "PERM_INT" || name == "PERM_VAR" || name == "PERM_ONCE")
+                    for (auto& a : p.rawArgs) a = trim(a);
                 for (auto& a : p.rawArgs) {
                     if (name == "PERM_IGNORE") {
                         auto t = std::make_shared<Node>();

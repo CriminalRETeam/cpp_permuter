@@ -12,7 +12,9 @@ struct CmdResult {
     std::string output; // stdout and stderr together
 };
 
-CmdResult runCommand(const std::string& cmd, int timeoutSec);
+// Runs cmd through the shell, with extra environment variables set.
+CmdResult runCommand(const std::string& cmd, int timeoutSec,
+                     const std::map<std::string, std::string>& env = {});
 
 std::string shellQuote(const std::string& s);
 

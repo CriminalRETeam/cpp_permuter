@@ -37,8 +37,12 @@ INCS="/I$(winpath "$(dirname "$SRC")") /I$(winpath "$GTA2_RE") /I$(winpath "$TOO
 # space under wine. NO_PCH=1 turns it off; if VC6 can't use the .pch the file is
 # compiled again without it.
 #
+# cpp_permuter sets PERMUTER_NO_PCH=1 while it edits headers (--inline-callees,
+# --also): VC6 decides whether the .pch is stale by timestamp, and a header
+# edited within the same second as the .pch would be missed.
+#
 # cl.exe exits 0 on warnings and 2 on errors; its output goes to stdout.
-if [ -z "${NO_PCH:-}" ]; then
+if [ -z "${NO_PCH:-}" ] && [ -z "${PERMUTER_NO_PCH:-}" ]; then
     LOG=$(wine cl.exe /nologo /TP /c $INCS $FLAGS /Zm500 /YX /Fp"$(winpath "${OBJ%.*}.pch")" \
         /Fo"$(winpath "$OBJ")" "$(winpath "$SRC")") && { printf '%s\n' "$LOG"; exit 0; }
     if ! printf '%s' "$LOG" | grep -q -E "C1060|C1076|C1083|C1852|C1853|C1859|C2859"; then

@@ -15,6 +15,7 @@ add_library(permuter_core STATIC
     src/analysis.cpp
     src/passes.cpp
     src/passes_control.cpp
+    src/passes_more.cpp
     src/scorer.cpp
     src/runner.cpp
     src/workspace.cpp

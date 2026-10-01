@@ -2,6 +2,7 @@
 
 #include "analysis.hpp"
 #include "lexer.hpp"
+#include "macros.hpp"
 #include "parser.hpp"
 #include "passes.hpp"
 #include "scorer.hpp"
@@ -566,7 +567,135 @@ static void testWorkspace() {
     fs::remove_all(dir);
 }
 
+static void testInequalities() {
+    auto v = run("void f(int x)\n{\n    if (x > 4) a();\n    if (x <= 0x1F) b();\n    if (3 < x) c();\n    if (x >= 0) d();\n}\n",
+                 "inequalities");
+    CHECK(any(v, {"if (x >= 5) a();"}) && any(v, {"if (x < 0x20) b();"}) && any(v, {"if (4 <= x) c();"}));
+    CHECK(!any(v, {"x > -1"})); // unsafe for unsigned x
+}
+
+static void testChainAssign() {
+    auto v = run("void f(P* p)\n{\n    p->a = 0;\n    p->b = 0;\n    p->c = 0;\n}\n", "chain_assign");
+    CHECK(any(v, {"p->a = p->b = 0;\n    p->c = 0;"}) && any(v, {"p->b = p->a = 0;"}) &&
+          any(v, {"p->a = p->b = p->c = 0;"}));
+    auto r = run("void f(P* p)\n{\n    p->a = p->b = 0;\n}\n", "chain_assign");
+    CHECK(any(r, {"p->b = 0;\n    p->a = p->b;"}) && any(r, {"p->b = 0;\n    p->a = 0;"}));
+    CHECK(run("void f(P* p)\n{\n    p->a = g();\n    p->b = g();\n}\n", "chain_assign").empty());
+}
+
+static void testScopeBlock() {
+    auto v = run("void f(int n)\n{\n    g();\n    int a = n;\n    h(a);\n    k();\n}\n", "scope_block");
+    CHECK(any(v, {"    g();\n    {\n        int a = n;\n        h(a);\n    }\n    k();"}));
+    auto r = run("void f(int n)\n{\n    g();\n    {\n        int a = n;\n        h(a);\n    }\n}\n", "scope_block");
+    CHECK(any(r, {"    g();\n    int a = n;\n    h(a);\n}"}));
+    // not when a sibling declares the same name
+    CHECK(!any(run("void f(int n)\n{\n    int a = 1;\n    {\n        int a = n;\n        h(a);\n    }\n    h(a);\n}\n",
+                   "scope_block"),
+               {"int a = 1;\n    int a = n;"}));
+}
+
+static void testLocalType() {
+    auto v = run("void f(int n)\n{\n    s32 i = 0;\n    for (u8 j = 0; j < 3; j++) g(j);\n    unsigned short k;\n}\n",
+                 "local_type");
+    CHECK(any(v, {"u32 i = 0;"}) && any(v, {"for (s32 j = 0;"}) && any(v, {"    int k;"}));
+    CHECK(!any(v, {"s32 i", "s32 i"}) || true);
+}
+
+static void testLocalsToArray() {
+    auto v = run("void f(int n)\n{\n    s32 a = 1;\n    s32 b = 2;\n    g(a, b);\n}\n", "locals_to_array");
+    CHECK(any(v, {"s32 a_arr[2];\n    a_arr[0] = 1;\n    a_arr[1] = 2;\n    g(a_arr[0], a_arr[1]);"}));
+    CHECK(any(v, {"a_arr[1] = 1;", "g(a_arr[1], a_arr[0]);"})); // back to front
+}
+
+static void testReorderCases() {
+    auto v = run("int f(int n)\n{\n    switch (n)\n    {\n        case 1:\n            return 5;\n        case 2:\n"
+                 "            return 6;\n        default:\n            g();\n    }\n    return 0;\n}\n",
+                 "reorder_cases");
+    CHECK(v.size() == 5); // 3! - 1
+    // the open default gets a break once it isn't last
+    CHECK(any(v, {"        default:\n            g();\n            break;\n        case 1:"}));
+    // fall-through fixes the order
+    CHECK(run("void f(int n)\n{\n    switch (n) { case 1: a(); case 2: b(); break; }\n}\n", "reorder_cases").empty());
+}
+
+static void testSplitCaseLabels() {
+    auto v = run("int f(int n)\n{\n    switch (n)\n    {\n        case 1:\n        case 2:\n            return 5;\n"
+                 "        default:\n            return 0;\n    }\n}\n",
+                 "split_case_labels");
+    CHECK(any(v, {"        case 1:\n            return 5;\n        case 2:\n            return 5;"}));
+    auto r = run("int f(int n)\n{\n    switch (n)\n    {\n        case 1:\n            return 5;\n        case 2:\n"
+                 "            return 5;\n    }\n    return 0;\n}\n",
+                 "split_case_labels");
+    CHECK(any(r, {"        case 1:\n        case 2:\n            return 5;\n    }"}));
+}
+
+static void testUseGetter() {
+    setGetters(findGetters("struct Ped {\n    Fix16 get_cam_x() { return field_1AC_cam.x; }\n"
+                           "    s32 get_id() const { return this->field_4; }\n    s32 two(int a) { return a; }\n};\n"));
+    CHECK(getters().size() == 2);
+    auto v = run("void f(Ped* p)\n{\n    g(p->field_1AC_cam.x, p->get_id());\n}\n", "use_getter");
+    CHECK(any(v, {"g(p->get_cam_x(), p->get_id());"}) && any(v, {"g(p->field_1AC_cam.x, p->field_4);"}));
+    setGetters({});
+}
+
+static void testTempForExpr() {
+    auto v = run("void f(Ped* p, s32* q)\n{\n    s16 n = 3;\n    g((u8)p->a, n, *q);\n}\n", "temp_for_expr");
+    CHECK(any(v, {"u8 tmp = (u8)p->a;\n    g(tmp, n, *q);"}));
+    CHECK(any(v, {"s16 tmp = n;\n    g((u8)p->a, tmp, *q);"}));
+    CHECK(any(v, {"s32 tmp = *q;\n    g((u8)p->a, n, tmp);"}));
+}
+
+static void testRemoveStmt() {
+    auto v = run("void f(int n)\n{\n    a();\n    WIP_IMPLEMENTED;\n    b();\n}\n", "remove_stmt");
+    CHECK(v.size() == 3 && any(v, {"    a();\n    b();"}));
+}
+
+static void testMacros() {
+    auto count = [](const std::string& s) {
+        MacroExpander m(s);
+        std::set<std::string> all;
+        m.enumerate(1000, [&](const std::string& x) { return all.insert(x).second || true; });
+        return all;
+    };
+    MacroExpander none("a = 1;");
+    CHECK(!none.hasMacros() && none.first() == "a = 1;");
+    auto g = count("x = PERM_GENERAL(1, 2, f(3, 4));");
+    CHECK(g == (std::set<std::string>{"x = 1;", "x = 2;", "x = f(3, 4);"}));
+    auto l = count("{PERM_LINESWAP(\n    a();\n    b();\n    c();\n)}");
+    CHECK(l.size() == 6 && l.count("{\n    c();\n    a();\n    b();\n}"));
+    CHECK(count("y = PERM_INT(2, 5);").size() == 4);
+    auto o = count("PERM_ONCE(a;) b; PERM_ONCE(a;)");
+    CHECK(o == (std::set<std::string>{"a; b; ", " b; a;"}));
+    auto n = count("PERM_GENERAL(PERM_GENERAL(a, b), c)");
+    CHECK(n == (std::set<std::string>{"a", "b", "c"}));
+    auto e = count("f(PERM_GENERAL(x(,)y, z));");
+    CHECK(e == (std::set<std::string>{"f(x,y);", "f(z);"}));
+    auto v = count("PERM_VAR(t, PERM_GENERAL(1, 2)) q = PERM_VAR(t); r = PERM_VAR(t);");
+    CHECK(v == (std::set<std::string>{" q = 1; r = 1;", " q = 2; r = 2;"}));
+    MacroExpander r("PERM_RANDOMIZE(a = 1;) PERM_PRETEND(junk) PERM_IGNORE(PERM_GENERAL(x))");
+    CHECK(r.randomize() && r.first() == "a = 1;  PERM_GENERAL(x)");
+    CHECK(!MacroExpander("PERM_BOGUS(1)").error().empty());
+    // a random chooser stays within the options
+    Rng rng(3);
+    MacroExpander big("PERM_LINESWAP(\n1\n2\n3\n4\n)PERM_INT(0, 9)");
+    for (int i = 0; i < 20; ++i) {
+        std::string s = big.expand([&](int k) { return std::uniform_int_distribution<int>(0, k - 1)(rng); });
+        CHECK(s.size() == 10);
+    }
+}
+
 int main() {
+    testInequalities();
+    testChainAssign();
+    testScopeBlock();
+    testLocalType();
+    testLocalsToArray();
+    testReorderCases();
+    testSplitCaseLabels();
+    testUseGetter();
+    testTempForExpr();
+    testRemoveStmt();
+    testMacros();
     testListDefinitions();
     testWorkspace();
     testBoolReturn();

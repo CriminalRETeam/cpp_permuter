@@ -30,6 +30,15 @@ const Pass* findPass(const std::string& name);
 // One random mutation of f by pass p. Returns false if p has nothing to offer.
 bool randomMutation(const Pass& p, const Func& f, Rng& rng, std::string& out);
 
+// An inline getter found in a header: "get_cam_x" returning "field_1AC_cam.x"
+// (the member path with whitespace removed). use_getter swaps between the two.
+struct Getter {
+    std::string name, expr;
+};
+std::vector<Getter> findGetters(const std::string& text);
+void setGetters(std::vector<Getter> g); // before the passes run
+const std::vector<Getter>& getters();
+
 // A pass, or a combination of passes written "a+b+c" on the command line.
 struct PassGroup {
     std::vector<const Pass*> passes;

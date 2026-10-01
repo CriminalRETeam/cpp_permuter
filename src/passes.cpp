@@ -820,8 +820,9 @@ void enumCompoundAssign(const Func& f, const EmitFn& emit) {
 // ---------------------------------------------------------------------------
 
 const std::vector<Pass>& allPasses() {
+    static const std::vector<Pass> passes = [] {
     using namespace util;
-    static const std::vector<Pass> passes = {
+    std::vector<Pass> passes = {
         {"reorder_saves",
          "Permute runs of consecutive local saves (declarations and assignments to locals "
          "that don't call or store) in every order that keeps dependencies",
@@ -881,6 +882,9 @@ const std::vector<Pass>& allPasses() {
         {"reassociate", "'a + b + c' <-> 'a + (b + c)' (for + * & | ^)", 6, enumReassociate,
          nullptr},
     };
+    registerMorePasses(passes);
+    return passes;
+    }();
     return passes;
 }
 
