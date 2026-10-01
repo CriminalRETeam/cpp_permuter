@@ -655,6 +655,33 @@ static void testTempForExpr() {
     CHECK(any(v, {"s32 tmp = *q;\n    g((u8)p->a, n, tmp);"}));
 }
 
+static void testNamedOp() {
+    setOpAliases({{"*", "Multiply_408680"}, {"neg", "Negate_4086A0"}});
+    auto v = run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return -a * b;\n}\n", "named_op");
+    CHECK(any(v, {"return (-a).Multiply_408680(b);"}));
+    CHECK(any(v, {"return a.Negate_4086A0() * b;"}));
+    auto back = run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return a.Negate_4086A0().Multiply_408680(b + a);\n}\n",
+                    "named_op");
+    CHECK(any(back, {"return (a.Negate_4086A0() * (b + a));"}));
+    CHECK(any(back, {"return (-a).Multiply_408680(b + a);"}));
+    // p->Negate() isn't rewritten: there is no value to apply the operator to
+    CHECK(run("Fix16 f(Fix16* p)\n{\n    return p->Negate_4086A0();\n}\n", "named_op").empty());
+    setOpAliases({});
+    CHECK(run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return a * b;\n}\n", "named_op").empty());
+}
+
+static void testCastOperand() {
+    auto v = run("u32 f(s32 a, u8 b)\n{\n    return a / b;\n}\n", "cast_operand");
+    CHECK(any(v, {"return (u32)a / b;"}));
+    CHECK(any(v, {"return a / (s32)b;"}));
+    CHECK(v.size() == 12);
+    auto c = run("u32 f(s32 a)\n{\n    return (s32)(a + 1) >> 2;\n}\n", "cast_operand");
+    CHECK(any(c, {"return (a + 1) >> 2;"}));
+    CHECK(any(c, {"return (u32)(a + 1) >> 2;"}));
+    // constants are left alone
+    CHECK(run("u32 f()\n{\n    return 4 >> 1;\n}\n", "cast_operand").empty());
+}
+
 static void testRemoveStmt() {
     auto v = run("void f(int n)\n{\n    a();\n    WIP_IMPLEMENTED;\n    b();\n}\n", "remove_stmt");
     CHECK(v.size() == 3 && any(v, {"    a();\n    b();"}));
@@ -715,6 +742,8 @@ int main() {
     testSplitCaseLabels();
     testUseGetter();
     testTempForExpr();
+    testNamedOp();
+    testCastOperand();
     testRemoveStmt();
     testMacros();
     testListDefinitions();

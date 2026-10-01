@@ -593,6 +593,113 @@ void enumRemoveStmt(const Func& f, const EmitFn& emit) {
 
 } // namespace
 
+// --- named_op ---------------------------------------------------------------------
+
+namespace {
+std::vector<OpAlias> gOpAliases;
+}
+
+} // namespace util
+
+void setOpAliases(std::vector<OpAlias> a) { util::gOpAliases = std::move(a); }
+const std::vector<OpAlias>& opAliases() { return util::gOpAliases; }
+
+namespace util {
+
+// x as the object of a method call: "a.f()" needs parens unless x is postfix-like.
+static std::string objectText(const Func& f, const Expr& x) {
+    std::string s = exprText(f, x);
+    return isPostfixLike(x) ? s : paren(s);
+}
+
+void enumNamedOp(const Func& f, const EmitFn& emit) {
+    const auto& aliases = opAliases();
+    if (aliases.empty()) return;
+    forEachSiteExpr(f, [&](const ExprSite&, std::shared_ptr<Expr>, Expr& x) {
+        // a * b  ->  a.Multiply(b),   -a  ->  a.Negate()
+        if (x.k == Expr::Binary || (x.k == Expr::Unary && f.t(x.op) == "-")) {
+            std::string op = x.k == Expr::Unary ? "neg" : f.t(x.op);
+            for (auto& a : aliases) {
+                if (a.op != op) continue;
+                std::string text = objectText(f, *x.kids[0]) + "." + a.method + "(" +
+                                   (x.k == Expr::Binary ? exprText(f, *x.kids[1]) : "") + ")";
+                if (!emitReplace(f, emit, x.b, x.e, text)) return false;
+            }
+        }
+        // a.Multiply(b)  ->  (a * b),   a.Negate()  ->  (-a)
+        if (x.k == Expr::Call && x.kids[0]->k == Expr::Member) {
+            const Expr& callee = *x.kids[0];
+            const Expr& obj = *callee.kids[0];
+            if (f.t(obj.e) != ".") return true;
+            const std::string& name = f.t(callee.e - 1);
+            for (auto& a : aliases) {
+                if (a.method != name) continue;
+                std::string text;
+                if (a.op == "neg" && x.kids.size() == 1)
+                    text = "(-" + operandText(f, obj, 99) + ")";
+                else if (a.op != "neg" && x.kids.size() == 2)
+                    text = "(" + operandText(f, obj, binPrec(a.op) - 1) + " " + a.op + " " +
+                           operandText(f, *x.kids[1], binPrec(a.op)) + ")";
+                if (!text.empty() && !emitReplace(f, emit, x.b, x.e, text)) return false;
+            }
+        }
+        return true;
+    });
+}
+
+// --- cast_operand ------------------------------------------------------------------
+
+static const char* const kCastTypes[] = {"u32", "s32", "u16", "s16", "u8", "s8"};
+
+static bool isIntegerType(std::string t) {
+    t = norm(t);
+    static const std::set<std::string> ints = {
+        "u32", "s32", "u16", "s16", "u8", "s8", "int", "unsignedint", "unsigned", "short", "unsignedshort",
+        "char", "unsignedchar", "signedchar", "long", "unsignedlong", "char_type", "DWORD", "WORD", "BYTE",
+        "BOOL", "bool", "size_t"};
+    return ints.count(t) != 0;
+}
+
+void enumCastOperand(const Func& f, const EmitFn& emit) {
+    auto types = localTypes(f);
+    forEachSiteExpr(f, [&](const ExprSite&, std::shared_ptr<Expr>, Expr& x) {
+        if (x.k != Expr::Binary) return true;
+        const std::string& op = f.t(x.op);
+        static const std::set<std::string> ops = {"/", "%", ">>", "<", ">", "<=", ">=", "+", "-", "*", "==", "!="};
+        if (!ops.count(op)) return true;
+        for (int side = 0; side < 2; ++side) {
+            const Expr& o = *x.kids[side];
+            if (o.k == Expr::Primary && f.toks[o.b].kind == TokKind::Number) continue;
+            // Only integers: a local of another type (Fix16, a pointer) or a call result
+            // would just fail to compile.
+            if (o.k == Expr::Call) continue;
+            if (o.k == Expr::Primary && f.isLocal(o.b)) {
+                auto it = types.find(f.t(o.b));
+                if (it != types.end() && !isIntegerType(it->second)) continue;
+            }
+            const Expr* inner = &o;
+            std::string have;
+            if (o.k == Expr::Cast && f.t(o.b) == "(") {
+                // an existing integer cast: drop it or change its type
+                int close = matchBracket(f.toks, o.b);
+                have = norm(f.tokText(o.b + 1, close));
+                bool known = false;
+                for (auto* t : kCastTypes) known |= have == t;
+                if (!known) continue;
+                inner = o.kids[0].get();
+                if (!emitReplace(f, emit, o.b, o.e, operandText(f, *inner, binPrec(op))))
+                    return false;
+            }
+            for (auto* t : kCastTypes) {
+                if (have == t) continue;
+                std::string text = "(" + std::string(t) + ")" + objectText(f, *inner);
+                if (!emitReplace(f, emit, o.b, o.e, text)) return false;
+            }
+        }
+        return true;
+    });
+}
+
 void registerMorePasses(std::vector<Pass>& passes) {
     passes.push_back({"inequalities", "'x > 4' <-> 'x >= 5', 'x < 4' <-> 'x <= 3' (integer constants)", 6,
                       enumInequalities, nullptr});
@@ -625,6 +732,14 @@ void registerMorePasses(std::vector<Pass>& passes) {
                       "Compute a cast, a local or '*p' into a new local first (types from the "
                       "declarations; also 'copy through a local to get a spill')",
                       8, enumTempForExpr, nullptr});
+    passes.push_back({"named_op",
+                      "'a * b' <-> 'a.Multiply_408680(b)', '-a' <-> 'a.Negate_4086A0()' for the "
+                      "operators given with --op-alias: whether VC6 inlines the operator",
+                      8, enumNamedOp, nullptr});
+    passes.push_back({"cast_operand",
+                      "Cast an operand of '/ % >> < > + - * == ...' to an integer type, or drop or "
+                      "change its cast: signed vs unsigned div, shifts, compares and byte maths",
+                      6, enumCastOperand, nullptr});
     passes.push_back({"remove_stmt", "Remove an expression statement", 2, enumRemoveStmt, nullptr});
 }
 

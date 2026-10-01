@@ -208,6 +208,14 @@ const std::vector<Sample>& samples() {
 {
     g((u8)p->a);
 })", {0}},
+        {"named_op", R"(Fix16 f(Fix16 a, Fix16 b)
+{
+    return -a * b;
+})", {0, 1}},
+        {"cast_operand", R"(u32 f(s32 a, u8 b)
+{
+    return a / b;
+})", {0, 6}},
         {"remove_stmt", R"(void f(Ped* p)
 {
     g();
@@ -236,12 +244,16 @@ std::string passExamplesMarkdown() {
          "passes also work in the other direction.\n\n";
     // use_getter needs a getter to know about
     setGetters({{"get_cam_x", "field_1AC_cam.x"}});
+    // named_op needs to know the named versions of the operators
+    setOpAliases({{"*", "Multiply_408680"}, {"neg", "Negate_4086A0"}});
     for (auto& s : samples()) {
         const Pass* p = findPass(s.pass);
         if (!p) continue;
         o << "## `" << s.pass << "`\n\n" << p->description << ".\n\n";
         if (std::string(s.pass) == "use_getter")
             o << "With `Fix16 get_cam_x() { return field_1AC_cam.x; }` in an included header:\n\n";
+        if (std::string(s.pass) == "named_op")
+            o << "With `--op-alias '*=Multiply_408680' --op-alias neg=Negate_4086A0`:\n\n";
         std::string err;
         auto f = parseFunc(s.code, err);
         std::vector<std::string> outs;

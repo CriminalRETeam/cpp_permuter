@@ -827,6 +827,68 @@ void f(Ped* p)
 
 (2 candidates in all for this function.)
 
+## `named_op`
+
+'a * b' <-> 'a.Multiply_408680(b)', '-a' <-> 'a.Negate_4086A0()' for the operators given with --op-alias: whether VC6 inlines the operator.
+
+With `--op-alias '*=Multiply_408680' --op-alias neg=Negate_4086A0`:
+
+```cpp
+Fix16 f(Fix16 a, Fix16 b)
+{
+    return -a * b;
+}
+```
+
+becomes
+
+```cpp
+Fix16 f(Fix16 a, Fix16 b)
+{
+    return (-a).Multiply_408680(b);
+}
+```
+
+becomes
+
+```cpp
+Fix16 f(Fix16 a, Fix16 b)
+{
+    return a.Negate_4086A0() * b;
+}
+```
+
+## `cast_operand`
+
+Cast an operand of '/ % >> < > + - * == ...' to an integer type, or drop or change its cast: signed vs unsigned div, shifts, compares and byte maths.
+
+```cpp
+u32 f(s32 a, u8 b)
+{
+    return a / b;
+}
+```
+
+becomes
+
+```cpp
+u32 f(s32 a, u8 b)
+{
+    return (u32)a / b;
+}
+```
+
+becomes
+
+```cpp
+u32 f(s32 a, u8 b)
+{
+    return a / (u32)b;
+}
+```
+
+(12 candidates in all for this function.)
+
 ## `remove_stmt`
 
 Remove an expression statement.
