@@ -22,6 +22,15 @@ jobs:
         # unit and clang integration tests; gta2_parse and vc6 need a gta2_re
         # checkout and wine, and report as skipped
         run: ctest --test-dir build --output-on-failure
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp_permuter-linux-x64
+          path: |
+            build/cpp_permuter
+            examples/gta2/compile.sh
+            README.md
+            LICENSE
 
   windows:
     runs-on: windows-latest
@@ -39,3 +48,12 @@ jobs:
       - name: Test
         shell: bash
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp_permuter-windows-x64
+          path: |
+            build/Release/cpp_permuter.exe
+            examples/gta2/compile.cmd
+            README.md
+            LICENSE

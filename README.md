@@ -25,6 +25,13 @@ How it works:
 4. Score it against the target: 0 means identical, lower is closer. Improvements are written
    to the output directory.
 
+## Getting it
+
+Every CI run builds `cpp_permuter-linux-x64` and `cpp_permuter-windows-x64` (the Windows one
+needs no Visual C++ redistributable). Download them from the run's artifacts on the
+[Actions page](https://github.com/CriminalRETeam/cpp_permuter/actions/workflows/ci.yml), or build
+from source:
+
 ## Building
 
 Needs CMake 3.16+ and a C++17 compiler: GCC or clang on Linux, MSVC (or MinGW) on Windows.
