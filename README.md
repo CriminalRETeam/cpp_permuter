@@ -27,10 +27,13 @@ How it works:
 
 ## Getting it
 
-Every CI run builds `cpp_permuter-linux-x64` and `cpp_permuter-windows-x64` (the Windows one
-needs no Visual C++ redistributable). Download them from the run's artifacts on the
-[Actions page](https://github.com/CriminalRETeam/cpp_permuter/actions/workflows/ci.yml), or build
-from source:
+Download a release from the [Releases page](https://github.com/CriminalRETeam/cpp_permuter/releases):
+`cpp_permuter-linux-x64` and `cpp_permuter-windows-x64` (the Windows one needs no Visual C++
+redistributable). Pushing a tag such as `v1.0.0` publishes one, after the CI builds and
+tests pass. Every CI run also keeps the binaries as artifacts for 90 days on the
+[Actions page](https://github.com/CriminalRETeam/cpp_permuter/actions/workflows/ci.yml).
+
+Or build from source:
 
 ## Building
 
