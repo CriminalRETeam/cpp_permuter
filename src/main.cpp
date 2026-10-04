@@ -86,6 +86,13 @@ Other functions (for helpers VC6 inlines into the target):
                             definitions in the source (if marked inline) and in the
                             headers it includes
       --max-callees N       at most N of those (default 8)
+      --extern-globals      also try each global the function reads declared the other way
+                            in its file: a definition as an extern declaration, or an
+                            extern as its definition (taken from another .cpp in the
+                            source's directory). VC6 can code a global defined in the same
+                            file differently (see README)
+      --global-macros D=E   the macros of those declarations (default
+                            DEFINE_GLOBAL=EXTERN_GLOBAL, gta2_re's Function.hpp)
   -I, --include-dir DIR     where to look for #include "..." headers besides the
                             including file's directory (default: the source's)
       --mirror-root DIR     candidates are compiled in a mirror of this directory
@@ -139,6 +146,8 @@ struct Options {
     std::string outputDir = "permuter_out";
     bool resume = false;
     std::vector<std::string> also, includeDirs, checkParse, opAliases;
+    bool externGlobals = false;
+    std::string globalMacros = "DEFINE_GLOBAL=EXTERN_GLOBAL";
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
     int maxCallees = 8;
@@ -221,6 +230,8 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "also") return need() && (o.also.push_back(val), true);
     if (key == "op-alias") return need() && (o.opAliases.push_back(val), true);
     if (key == "inline-callees") return o.inlineCallees = true;
+    if (key == "extern-globals") return o.externGlobals = true;
+    if (key == "global-macros") return need() && (o.globalMacros = val, true);
     if (key == "max-callees") return num(o.maxCallees);
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
     if (key == "mirror-root") return need() && (o.mirrorRoot = val, true);
@@ -242,7 +253,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals",
     };
     return flags.count(k) > 0;
 }
@@ -718,17 +729,30 @@ void printStatus(State& st) {
 
 // One random candidate derived from start; empty if nothing applied. With
 // several regions, half the mutations go to the target function.
-Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, const Cand& start,
-                     Rng& rng) {
+// A global's declaration region switched to its other form, or back.
+std::string toggledGlobal(const Workspace& ws, const Cand& c, size_t r) {
+    return c[r] == ws.base[r] ? ws.regions[r].alt : ws.base[r];
+}
+
+Cand randomCandidate(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups,
+                     const Cand& start, Rng& rng) {
     int total = 0;
     for (auto& g : groups) total += g.weight();
     if (total <= 0) return {};
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
     Cand c = start;
+    std::vector<size_t> funcs, globals; // regions by kind; funcs[0] is the target
+    for (size_t i = 0; i < c.size(); ++i) (ws.regions[i].alt.empty() ? funcs : globals).push_back(i);
     for (int m = 0; m < k; ++m) {
+        // a global's declaration: one mutation in eight
+        if (!globals.empty() && std::uniform_int_distribution<int>(0, 7)(rng) == 0) {
+            size_t g = globals[std::uniform_int_distribution<size_t>(0, globals.size() - 1)(rng)];
+            c[g] = toggledGlobal(ws, c, g);
+            continue;
+        }
         size_t r = 0;
-        if (c.size() > 1 && std::uniform_int_distribution<int>(0, 1)(rng) == 1)
-            r = std::uniform_int_distribution<size_t>(1, c.size() - 1)(rng);
+        if (funcs.size() > 1 && std::uniform_int_distribution<int>(0, 1)(rng) == 1)
+            r = funcs[std::uniform_int_distribution<size_t>(1, funcs.size() - 1)(rng)];
         for (int attempt = 0; attempt < 10; ++attempt) {
             int x = std::uniform_int_distribution<int>(0, total - 1)(rng);
             const PassGroup* g = &groups.back();
@@ -749,7 +773,7 @@ Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, con
     return c == start ? Cand{} : c;
 }
 
-void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+void enumerateCand(const Workspace& ws, const std::vector<PassGroup>& groups, const Cand& c,
                    const std::function<bool(const Cand&, const std::string&)>& emit);
 
 bool hasMacros(const Workspace& ws) { return ws.macro && ws.macro->hasMacros(); }
@@ -768,7 +792,7 @@ Cand nextRandom(const Options& o, const Workspace& ws, const std::vector<PassGro
         // a third of the time, the expansion on its own
         if (!ws.passesOn || (start != ws.base && coin(rng) < 1.0 / 3)) return start == ws.base ? Cand{} : start;
     }
-    Cand c = randomCandidate(o, groups, start, rng);
+    Cand c = randomCandidate(o, ws, groups, start, rng);
     if (c.empty() && start != ws.base) return start;
     return c;
 }
@@ -796,7 +820,7 @@ void exhaustiveCands(const Options& o, const Workspace& ws, const std::vector<Pa
         std::vector<Cand> next;
         for (auto& c : level) {
             if (stop) break;
-            enumerateCand(groups, c, [&](const Cand& n, const std::string& g) {
+            enumerateCand(ws, groups, c, [&](const Cand& n, const std::string& g) {
                 int r = emit(n, g);
                 if (r == 0) stop = true;
                 if (r == 1 && d < o.depth) next.push_back(n);
@@ -862,11 +886,18 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
     return 0;
 }
 
-// Every candidate one pass or combo away from c, in any region.
-void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+// Every candidate one pass or combo away from c, in any region (for a global's
+// declaration: the other form).
+void enumerateCand(const Workspace& ws, const std::vector<PassGroup>& groups, const Cand& c,
                    const std::function<bool(const Cand&, const std::string&)>& emit) {
     bool stop = false;
-    for (size_t r = 0; r < c.size() && !stop; ++r)
+    for (size_t r = 0; r < c.size() && !stop; ++r) {
+        if (!ws.regions[r].alt.empty()) {
+            Cand n = c;
+            n[r] = toggledGlobal(ws, c, r);
+            if (!emit(n, "extern_global")) stop = true;
+            continue;
+        }
         for (auto& g : groups) {
             if (stop) break;
             enumerateGroup(g, c[r], [&](const std::string& s) {
@@ -876,6 +907,7 @@ void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
                 return !stop;
             });
         }
+    }
 }
 
 int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
@@ -1193,7 +1225,7 @@ int main(int argc, char** argv) {
     if (dirs.empty()) dirs.push_back(fs::path(srcPath).parent_path().string());
     ws.root = o.mirrorRoot.empty() ? fs::path(srcPath).parent_path().string()
                                    : fs::absolute(o.mirrorRoot).lexically_normal().string();
-    ws.regions.push_back({srcPath, start, end, o.function});
+    ws.regions.push_back({srcPath, start, end, o.function, ""});
     auto addRegion = [&](const Region& r) {
         for (auto& x : ws.regions)
             if (x.file == r.file && x.start < r.end && r.start < x.end) return; // overlaps
@@ -1209,12 +1241,30 @@ int main(int argc, char** argv) {
     }
     if (o.inlineCallees)
         for (auto& r : inlineCallees(srcPath, start, end, *func, dirs, (size_t)o.maxCallees)) addRegion(r);
+    if (o.externGlobals) {
+        size_t eq = o.globalMacros.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == o.globalMacros.size()) {
+            std::cerr << "error: --global-macros " << o.globalMacros << ": expected DEFINE=EXTERN\n";
+            return 2;
+        }
+        std::set<std::string> names;
+        for (auto& t : func->toks)
+            if (t.kind == TokKind::Ident) names.insert(t.text);
+        std::string text;
+        readFile(srcPath, text);
+        for (auto& r : globalRegions(srcPath, text, names, o.globalMacros.substr(0, eq), o.globalMacros.substr(eq + 1)))
+            addRegion(r);
+    }
     for (auto& r : ws.regions) {
         if (!ws.files.count(r.file) && !readFile(r.file, ws.files[r.file])) {
             std::cerr << "error: can't read " << r.file << "\n";
             return 1;
         }
         std::string text = ws.files[r.file].substr(r.start, r.end - r.start);
+        if (!r.alt.empty()) { // a global's declaration, not a function
+            ws.base.push_back(text);
+            continue;
+        }
         if (ws.base.empty()) {
             ws.macro = std::make_shared<MacroExpander>(text);
             if (!ws.macro->error().empty()) {
