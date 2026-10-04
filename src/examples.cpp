@@ -221,6 +221,31 @@ const std::vector<Sample>& samples() {
     g();
     WIP_IMPLEMENTED;
 })", {1}},
+        {"cache_member", R"(void f(Ped* p)
+{
+    g(p->field_8_car);
+    h(p->field_8_car);
+})", {0, 1}},
+        {"ref_local", R"(void f(Ped* p)
+{
+    Fix16 x = p->GetX();
+    g(x);
+})", {0}},
+        {"incdec", R"(void f(Ped* p)
+{
+    p->count++;
+})", {0, 1}},
+        {"cond_temp", R"(void f(Ped* p)
+{
+    if (p->a && p->b)
+    {
+        g();
+    }
+})", {0}},
+        {"pow2_shift", R"(s32 f(s32 a)
+{
+    return a * 8;
+})", {0}},
     };
     return s;
 }
@@ -244,6 +269,7 @@ std::string passExamplesMarkdown() {
          "passes also work in the other direction.\n\n";
     // use_getter needs a getter to know about
     setGetters({{"get_cam_x", "field_1AC_cam.x"}});
+    setFieldTypes({{"field_8_car", "Car_BC*"}});
     // named_op needs to know the named versions of the operators
     setOpAliases({{"*", "Multiply_408680"}, {"neg", "Negate_4086A0"}});
     for (auto& s : samples()) {
@@ -276,6 +302,7 @@ std::string passExamplesMarkdown() {
             o << "(" << outs.size() << " candidates in all for this function.)\n\n";
     }
     setGetters({});
+    setFieldTypes({});
     return o.str();
 }
 

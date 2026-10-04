@@ -5,6 +5,7 @@
 #include "analysis.hpp"
 #include "passes.hpp"
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -67,5 +68,10 @@ void enumReassociate(const Func& f, const EmitFn& emit);
 
 // passes_more.cpp
 void registerMorePasses(std::vector<Pass>& passes);
+// declared types of the locals and parameters: "s32", "Ped*", ...
+std::map<std::string, std::string> localTypes(const Func& f);
+
+// passes_manual.cpp
+void registerManualPasses(std::vector<Pass>& passes);
 
 } // namespace perm::util

@@ -1072,14 +1072,21 @@ int main(int argc, char** argv) {
     // inline getters for use_getter: in the source and the headers it includes
     {
         std::vector<Getter> gs;
+        std::map<std::string, std::string> fts;
         std::vector<std::string> files = {srcPath};
         for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
         for (auto& file : files) {
             std::string text;
-            if (readFile(file, text))
-                for (auto& g : findGetters(text)) gs.push_back(g);
+            if (!readFile(file, text)) continue;
+            for (auto& g : findGetters(text)) gs.push_back(g);
+            for (auto& [n, t] : findFieldTypes(text)) {
+                auto it = fts.find(n);
+                if (it == fts.end()) fts[n] = t;
+                else if (it->second != t) it->second.clear();
+            }
         }
         setGetters(gs);
+        setFieldTypes(fts);
     }
     // operators with named out-of-line versions, for named_op
     {

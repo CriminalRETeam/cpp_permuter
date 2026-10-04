@@ -912,3 +912,141 @@ void f(Ped* p)
 
 (2 candidates in all for this function.)
 
+## `cache_member`
+
+Read a member path used in the function into a local first: 'T c = p->f;', 'T& c = p->f;' or, for a struct, 'T* c = &p->f;' (types from the member declarations in the included headers), for all uses or the first.
+
+```cpp
+void f(Ped* p)
+{
+    g(p->field_8_car);
+    h(p->field_8_car);
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car_BC* cached = p->field_8_car;
+    g(cached);
+    h(cached);
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car_BC* cached = p->field_8_car;
+    g(cached);
+    h(p->field_8_car);
+}
+```
+
+## `ref_local`
+
+'T x = e;' <-> 'const T& x = e;' <-> 'T& x = e;' (a named local gets its own stack slot, a temporary bound to a reference may share one).
+
+```cpp
+void f(Ped* p)
+{
+    Fix16 x = p->GetX();
+    g(x);
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    const Fix16 & x = p->GetX();
+    g(x);
+}
+```
+
+(2 candidates in all for this function.)
+
+## `incdec`
+
+'x++' <-> '++x' <-> 'x += 1' <-> 'x = x + 1' (and '--').
+
+```cpp
+void f(Ped* p)
+{
+    p->count++;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    ++p->count;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    p->count += 1;
+}
+```
+
+(3 candidates in all for this function.)
+
+## `cond_temp`
+
+Compute an if condition into a local first: 's32 cond = c; if (cond)'.
+
+```cpp
+void f(Ped* p)
+{
+    if (p->a && p->b)
+    {
+        g();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    s32 cond = p->a && p->b;
+    if (cond)
+    {
+        g();
+    }
+}
+```
+
+(3 candidates in all for this function.)
+
+## `pow2_shift`
+
+'x * 4' <-> 'x << 2', 'x / 4' -> 'x >> 2' (also '*=' / '<<='): read the diff, '/' and '>>' differ for negative values.
+
+```cpp
+s32 f(s32 a)
+{
+    return a * 8;
+}
+```
+
+becomes
+
+```cpp
+s32 f(s32 a)
+{
+    return (a << 3);
+}
+```
+

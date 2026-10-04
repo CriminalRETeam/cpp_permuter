@@ -5,6 +5,7 @@
 #include "parser.hpp"
 
 #include <functional>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -47,6 +48,13 @@ struct OpAlias {
 };
 void setOpAliases(std::vector<OpAlias> a); // before the passes run
 const std::vector<OpAlias>& opAliases();
+
+// Declared types of the members (and other one-per-line declarations) in the
+// source and the headers it includes, by name: "field_7C_pObj" -> "Object_2C*".
+// Names declared with different types are left out. cache_member uses these.
+std::map<std::string, std::string> findFieldTypes(const std::string& text);
+void setFieldTypes(std::map<std::string, std::string> t); // before the passes run
+const std::map<std::string, std::string>& fieldTypes();
 
 // A pass, or a combination of passes written "a+b+c" on the command line.
 struct PassGroup {

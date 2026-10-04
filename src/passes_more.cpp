@@ -488,6 +488,8 @@ void enumUseGetter(const Func& f, const EmitFn& emit) {
 
 // --- temp_for_expr -------------------------------------------------------------
 
+} // namespace
+
 // Declared types of the locals and parameters: "s32", "Ped*", ...
 std::map<std::string, std::string> localTypes(const Func& f) {
     std::map<std::string, std::string> out;
@@ -530,6 +532,8 @@ std::map<std::string, std::string> localTypes(const Func& f) {
     }
     return out;
 }
+
+namespace {
 
 void enumTempForExpr(const Func& f, const EmitFn& emit) {
     auto types = localTypes(f);
