@@ -135,9 +135,10 @@ run bool_return IsReady control -m exhaustive -p "$(all_but bool_return)"
 expect_no_match
 for c in ternary_arg:Notify switch_if:OnCommand branch_dup:Update \
          cond_split:Check negate_const:Offset reassociate:Sum inequalities:Check \
-         chain_assign:Clear:move_stmt local_type:Count locals_to_array:Pair reorder_cases:Pick \
+         chain_assign:Clear:move_stmt local_type:Count:local_type locals_to_array:Pair reorder_cases:Pick \
          split_case_labels:Pick use_getter:Next temp_for_expr:Send remove_stmt:Finish; do
-    # pass:function[:other pass that reaches the same code, left out of the control]
+    # pass:function[:other pass that reaches the same code, left out of the control; the
+    # pass itself when it has equivalent forms, e.g. "unsigned long" for "unsigned int"]
     pass=${c%%:*} rest=${c#*:} fn=${rest%%:*} also=""
     [ "$rest" != "$fn" ] && also=${rest#*:}
     run "$pass" "$fn" exhaustive -m exhaustive -p "$pass"
@@ -172,6 +173,36 @@ run inline_callee Score random -m random -p swap_operands,flip_compare --inline-
 expect_match
 run inline_callee Score control -m exhaustive
 expect_no_match
+
+# --- resume: a run stopped and resumed tries the same candidates as one that wasn't ---
+# (-j 1: the same seed then gives the same candidates in the same order)
+resume_check() {
+    mode=$1
+    shift
+    N=$((N + 1))
+    LABEL="resume: $mode"
+    R="$WORK/resume_$N"
+    mkdir -p "$R/a" "$R/b"
+    cp "$HERE/combo/base/"* "$R/a/"
+    cp "$HERE/combo/base/"* "$R/b/"
+    $CXX --target=i686-pc-windows-msvc -O0 -c "$HERE/combo/target/main.cpp" -o "$R/t.obj" || exit 1
+    p="$PERMUTER -f Group::Swap -c \"$COMPILE\" -t $R/t.obj -j 1 --seed 3 -m $mode -p swap_operands,flip_compare,move_stmt"
+    eval "$p -s $R/a/main.cpp -o $R/outa $*" > "$WORK/log_$N" 2>&1
+    eval "$p -s $R/b/main.cpp -o $R/outb $1 $(($2 / 2))" >> "$WORK/log_$N" 2>&1
+    # -n counts this run's compiles, --max-candidates the whole search's
+    if [ "$1" = -n ]; then rest="$1 $(($2 / 2))"; else rest="$*"; fi
+    eval "$p -s $R/b/main.cpp -o $R/outb --resume $rest" >> "$WORK/log_$N" 2>&1
+    grep -q '^resuming at candidate' "$WORK/log_$N" || { fail "didn't resume"; return; }
+    for f in checkpoint.txt checkpoint_seen.txt; do
+        if [ "$(sort "$R/outa/$f")" != "$(sort "$R/outb/$f")" ]; then
+            fail "$f differs from an uninterrupted run"
+            diff "$R/outa/$f" "$R/outb/$f" | head
+            return
+        fi
+    done
+}
+resume_check random -n 40
+resume_check exhaustive --max-candidates 30
 
 echo
 if [ "$FAILED" -ne 0 ]; then

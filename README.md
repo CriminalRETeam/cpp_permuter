@@ -88,6 +88,7 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `-I DIR` | where to find headers for `--inline-callees`/`--also`, besides each file's own directory. The compiler's include paths stay in your compile command |
 | `--inline-callees`, `--also [FILE:]NAME` | also permute inline helpers the function calls, see below |
 | `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
+| `--resume` | carry on from the checkpoint in the output directory, see Resuming a run |
 
 Each improvement goes to `permuter_out/output-<score>-<n>/`:
 
@@ -99,6 +100,35 @@ Each improvement goes to `permuter_out/output-<score>-<n>/`:
 - `score_output.txt`: with `--score-cmd`, what the score command printed.
 
 The exit status is 0 if a match was found and 3 if not.
+
+### Resuming a run
+
+Every run keeps a checkpoint in its output directory (`checkpoint.txt`, `checkpoint_best.txt`
+and `checkpoint_seen.txt`), written every couple of seconds and on exit, Ctrl-C included.
+Run again with the same options plus `--resume` to carry on where it stopped:
+
+```sh
+cpp_permuter -s Ped.cpp -f Ped::Foo_123456 -c '...' --score-cmd '...' -j 4 -n 2000
+# stopped, or out of time: the next 2000
+cpp_permuter -s Ped.cpp -f Ped::Foo_123456 -c '...' --score-cmd '...' -j 4 -n 2000 --resume
+```
+
+- Candidates are numbered in the order they are generated. In random mode, candidate `n` is
+  made from its own random generator, seeded from the run's seed and `n` (the seed is printed
+  at the start and kept in the checkpoint, so `--seed` isn't needed to resume). With `-j 1` a
+  seed always gives the same candidates in the same order. With more jobs a candidate can also
+  depend on which improvements had landed when it was made (`--keep-prob`), but a resumed run
+  still starts at the first candidate that wasn't scored and skips every one already tried.
+- Exhaustive mode's order doesn't depend on the scores: a resumed run replays the earlier
+  candidates without compiling them and continues with exactly the ones that weren't scored.
+- The checkpoint records a key made from the function's source, the mode, `-p`, `--weight`,
+  `--op-alias`, `--depth`, `--max-mutations` and `--keep-prob`. `--resume` refuses a
+  checkpoint whose key differs (the source changed, or other passes), since its numbering
+  would mean different candidates. `-j`, `-n`, `--max-candidates` and the output options can
+  change between runs.
+- `-n` counts the compiles of this run; the totals carry over. `--max-candidates` counts
+  from the start of the search. Output directories keep
+  numbering after the earlier run's.
 
 Candidates are compiled in a mirror of the source's directory under
 `permuter_out/.work/w<N>/`, one per worker. The mirror is built from symlinks to every entry,
