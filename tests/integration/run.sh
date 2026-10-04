@@ -174,6 +174,19 @@ expect_match
 run inline_callee Score control -m exhaustive
 expect_no_match
 
+# --- extern_global: a global's definition <-> extern declaration -----------
+# (clang codes both the same, so this checks the candidates, not a match)
+N=$((N + 1))
+LABEL="extern_global: candidates"
+mkdir -p "$WORK/eg_$N"
+cp "$HERE/extern_global/base/"* "$WORK/eg_$N/"
+"$PERMUTER" -s "$WORK/eg_$N/main.cpp" -f Advance -c "$COMPILE" -t /dev/null --extern-globals \
+    -m exhaustive -p swap_operands --dry-run > "$WORK/log_$N" 2>&1
+grep -q '^+EXTERN_GLOBAL(short, gStep);' "$WORK/log_$N" || fail "no extern candidate for the definition"
+grep -q '^+DEFINE_GLOBAL_INIT(short, gBase, 4, 0x1004);' "$WORK/log_$N" ||
+    fail "no definition (from other.cpp) for the extern"
+grep -q 'gUnused' "$WORK/log_$N" && fail "a global the function doesn't read was offered"
+
 # --- resume: a run stopped and resumed tries the same candidates as one that wasn't ---
 # (-j 1: the same seed then gives the same candidates in the same order)
 resume_check() {

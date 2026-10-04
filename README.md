@@ -89,6 +89,7 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--inline-callees`, `--also [FILE:]NAME` | also permute inline helpers the function calls, see below |
 | `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
 | `--resume` | carry on from the checkpoint in the output directory, see Resuming a run |
+| `--extern-globals` | also try the function's globals declared the other way (definition vs extern), see Globals defined in the same file |
 
 Each improvement goes to `permuter_out/output-<score>-<n>/`:
 
@@ -163,6 +164,33 @@ Every pass then also works on those helpers. Half of the random mutations go to 
 function, and exhaustive mode tries every pass on every function. Only the target function
 is scored. When a candidate matches, the output has the changed headers next to
 `source.cpp`.
+
+## Globals defined in the same file
+
+VC6 can code a read of a global differently depending on whether the file
+being compiled defines it or only declares it `extern`. In gta2_re, a 2-byte
+global defined in the same file got 32-bit loads, and the original's 16-bit
+loads came back once its definition moved to another file. `--extern-globals`
+lets the permuter try that:
+
+```sh
+cpp_permuter ... --extern-globals
+```
+
+- Each global the function names gets its own region, holding its declaration
+  line in the source file.
+  - A definition (`DEFINE_GLOBAL...(type, name, ...)`) can become
+    `EXTERN_GLOBAL(type, name);` (`EXTERN_GLOBAL_ARRAY(type, name, size);` for
+    arrays).
+  - An extern declaration can become its definition, copied from another .cpp in
+    the source's directory.
+- `--global-macros DEFINE=EXTERN` names other macros with the same argument
+  layout. The default is gta2_re's `DEFINE_GLOBAL=EXTERN_GLOBAL`.
+- Exhaustive mode tries each switch on its own. Random mode switches a global in
+  one mutation in eight.
+- Only the candidate's own object is compiled and scored, so a missing
+  definition doesn't matter. If a switch wins, move the definition by hand: to
+  another .cpp for an extern, or into this file for a definition.
 
 ## PERM macros
 

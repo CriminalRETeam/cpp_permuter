@@ -18,6 +18,9 @@ struct Region {
     size_t start = 0;  // byte range of the definition in the original file
     size_t end = 0;
     std::string name;  // as given or found, e.g. "Ped::GetX"
+    // A global's declaration rather than a function: the other form of the line
+    // (the extern declaration of a definition, or the definition of an extern).
+    std::string alt;
 };
 
 // Names of the functions called in f's body (the last component: "GetX" for
@@ -36,6 +39,15 @@ std::vector<Region> inlineCallees(const std::string& srcPath, size_t mainStart, 
                                   size_t maxRegions);
 
 // Replaces each region's range in original with its text. Ranges must not overlap.
+// The definitions and extern declarations, in srcText, of the globals named in
+// `names`, as regions whose alt is the other form, for --extern-globals. Lines
+// look like gta2_re's Function.hpp macros: "<define>[_INIT|_ARRAY...](type, name,
+// ...)" and "<extern>[_ARRAY](type, name[, size])". An extern's definition is
+// looked for in the other .cpp files of srcPath's directory.
+std::vector<Region> globalRegions(const std::string& srcPath, const std::string& srcText,
+                                  const std::set<std::string>& names, const std::string& definePrefix,
+                                  const std::string& externPrefix);
+
 std::string spliceRegions(const std::string& original,
                           std::vector<std::pair<const Region*, const std::string*>> parts);
 
