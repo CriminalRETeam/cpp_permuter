@@ -95,6 +95,8 @@ Other functions (for helpers VC6 inlines into the target):
 
 Output:
   -o, --output-dir DIR      where improvements go (default: permuter_out)
+      --resume              carry on from the checkpoint a previous run with the same
+                            function, passes and search options left in the output dir
       --keep-ties           also write candidates that tie the best score
       --only-if-below N     only write candidates scoring below N
       --base-only           compile and score the unmodified function, then exit
@@ -135,6 +137,7 @@ struct Options {
     int jobs = 1;
     int timeout = 120;
     std::string outputDir = "permuter_out";
+    bool resume = false;
     std::vector<std::string> also, includeDirs, checkParse, opAliases;
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
@@ -214,6 +217,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "jobs" || key == "j") return num(o.jobs);
     if (key == "timeout") return num(o.timeout);
     if (key == "output-dir" || key == "o") return need() && (o.outputDir = val, true);
+    if (key == "resume") return o.resume = true;
     if (key == "also") return need() && (o.also.push_back(val), true);
     if (key == "op-alias") return need() && (o.opAliases.push_back(val), true);
     if (key == "inline-callees") return o.inlineCallees = true;
@@ -238,7 +242,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume",
     };
     return flags.count(k) > 0;
 }
@@ -385,10 +389,25 @@ struct Stopwatch {
     }
 };
 
+// FNV-1a: the same on every platform and build, so checkpoints can store hashes.
+uint64_t fnv64(const std::string& s, uint64_t h = 14695981039346656037ull) {
+    for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
+    return h;
+}
+
 size_t hashCand(const Cand& c) {
     std::string all;
     for (auto& t : c) all += t + '\x01';
-    return std::hash<std::string>()(all);
+    return (size_t)fnv64(all);
+}
+
+// The random generator of candidate number idx: every candidate has its own,
+// so a run can be resumed from any index.
+Rng candRng(uint64_t seed, long idx) {
+    uint64_t z = seed + 0x9E3779B97F4A7C15ull * (uint64_t)(idx + 1);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return Rng(z ^ (z >> 31));
 }
 
 struct Workspace {
@@ -498,7 +517,132 @@ struct State {
     long compiles = 0, failures = 0, improvements = 0;
     std::unordered_set<size_t> seen;
     int outputs = 0, ties = 0;
+    // checkpointing: candidates are numbered in the order they are generated
+    std::string key;           // what a checkpoint must match to be resumed
+    uint64_t seed = 0;         // random mode
+    long next = 0;             // index of the next candidate to generate
+    long resumeFrom = 0;       // exhaustive: candidates before this were done by an earlier run
+    long compilesAtStart = 0;  // -n counts this run's compiles
+    std::set<long> inFlight;   // generated but not yet scored
 };
+
+// --- checkpoints ------------------------------------------------------------------
+//
+// <output-dir>/checkpoint.txt holds the search position, checkpoint_best.txt the
+// best candidate and checkpoint_seen.txt the hashes of the candidates already tried
+// (random mode). Candidate n of a run is a function of (key, seed, n) and, in random
+// mode with --keep-prob, of the best candidate when it was generated: -j 1 always
+// gives the same sequence, and a resumed run carries on from the first candidate
+// that wasn't scored.
+
+const char* const kRegionSep = "\n@@@cpp_permuter region@@@\n";
+
+std::string checkpointKey(const Options& o, const std::vector<std::string>& base) {
+    std::string k = o.function + '\x01' + o.mode + '\x01';
+    for (auto& p : o.passes) k += p + ',';
+    for (auto& w : o.weights) k += w + ',';
+    for (auto& a : o.opAliases) k += a + ',';
+    k += '\x01' + std::to_string(o.depth) + '\x01' + std::to_string(o.maxMutations) + '\x01' +
+         std::to_string(o.keepProb) + '\x01';
+    for (auto& r : base) k += r + '\x01';
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)fnv64(k));
+    return buf;
+}
+
+// Call with st.mu held.
+void saveCheckpoint(const Options& o, const State& st) {
+    std::error_code ec;
+    fs::create_directories(o.outputDir, ec);
+    long next = st.inFlight.empty() ? st.next : *st.inFlight.begin();
+    std::ostringstream c;
+    c << "cpp_permuter checkpoint 1\n"
+      << "key " << st.key << "\n"
+      << "mode " << o.mode << "\n"
+      << "seed " << st.seed << "\n"
+      << "next " << next << "\n"
+      << "compiles " << st.compiles << "\n"
+      << "failures " << st.failures << "\n"
+      << "improvements " << st.improvements << "\n"
+      << "outputs " << st.outputs << "\n"
+      << "best_score " << st.bestScore << "\n";
+    std::string best;
+    for (size_t i = 0; i < st.best.size(); ++i) best += (i ? kRegionSep : "") + st.best[i];
+    std::string seen;
+    if (o.mode == "random") {
+        char buf[20];
+        for (size_t h : st.seen) {
+            std::snprintf(buf, sizeof buf, "%016llx\n", (unsigned long long)h);
+            seen += buf;
+        }
+    }
+    auto put = [&](const std::string& name, const std::string& text) {
+        fs::path p = fs::path(o.outputDir) / name, tmp = p;
+        tmp += ".tmp";
+        if (writeFile(tmp.string(), text)) fs::rename(tmp, p, ec);
+    };
+    put("checkpoint_best.txt", best);
+    put("checkpoint_seen.txt", seen);
+    put("checkpoint.txt", c.str()); // last: it is what --resume looks for
+}
+
+bool loadCheckpoint(const Options& o, State& st, std::string& err) {
+    std::string text;
+    fs::path dir(o.outputDir);
+    if (!readFile((dir / "checkpoint.txt").string(), text)) {
+        err = "no checkpoint in " + o.outputDir;
+        return false;
+    }
+    std::map<std::string, std::string> kv;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t sp = line.find(' ');
+        if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
+    }
+    if (kv["key"] != st.key) {
+        err = "the checkpoint in " + o.outputDir +
+              " is for a different function, source or search options (key " + kv["key"] + ", now " + st.key + ")";
+        return false;
+    }
+    try {
+        st.seed = std::stoull(kv["seed"]);
+        st.next = st.resumeFrom = std::stol(kv["next"]);
+        st.compiles = st.compilesAtStart = std::stol(kv["compiles"]);
+        st.failures = std::stol(kv["failures"]);
+        st.improvements = std::stol(kv["improvements"]);
+        st.outputs = std::stoi(kv["outputs"]);
+        long bestScore = std::stol(kv["best_score"]);
+        std::string best;
+        if (bestScore < st.bestScore && readFile((dir / "checkpoint_best.txt").string(), best)) {
+            Cand c;
+            size_t at = 0, sep;
+            std::string s = kRegionSep;
+            while ((sep = best.find(s, at)) != std::string::npos) {
+                c.push_back(best.substr(at, sep - at));
+                at = sep + s.size();
+            }
+            c.push_back(best.substr(at));
+            if (c.size() == st.base.size()) {
+                st.best = c;
+                st.bestScore = bestScore;
+            }
+        }
+    } catch (...) {
+        err = "can't read " + (dir / "checkpoint.txt").string();
+        return false;
+    }
+    if (o.mode == "random") {
+        std::string seen;
+        readFile((dir / "checkpoint_seen.txt").string(), seen);
+        std::istringstream sin(seen);
+        while (std::getline(sin, line))
+            if (!line.empty()) st.seen.insert((size_t)std::stoull(line, nullptr, 16));
+    } else {
+        st.next = 0; // exhaustive: replayed from the start, see runExhaustive
+    }
+    return true;
+}
 
 // Diff of every region that changed, with a header per region when there are several.
 std::string candDiff(const Workspace& ws, const Cand& c) {
@@ -543,8 +687,9 @@ void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c
 
 // Records a scored candidate. Returns true if it was a match and we should stop.
 bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
-            const std::vector<Insn>& insns, const std::string& log) {
+            const std::vector<Insn>& insns, const std::string& log, long idx = -1) {
     std::lock_guard<std::mutex> lk(st.mu);
+    st.inFlight.erase(idx);
     st.compiles++;
     if (score < 0) {
         st.failures++;
@@ -663,20 +808,22 @@ void exhaustiveCands(const Options& o, const Workspace& ws, const std::vector<Pa
 }
 
 int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
-    unsigned long long seed = o.seedSet ? o.seed : (unsigned long long)std::random_device{}();
     std::vector<std::thread> workers;
     std::atomic<int> idle{0};
     for (int w = 0; w < o.jobs; ++w) {
         workers.emplace_back([&, w]() {
-            Rng rng(seed + (unsigned long long)w * 7919);
             int misses = 0;
             while (!gStop) {
                 Cand best;
+                long idx;
                 {
                     std::lock_guard<std::mutex> lk(st.mu);
-                    if (o.iterations && st.compiles >= o.iterations) break;
+                    if (o.iterations && st.compiles - st.compilesAtStart >= o.iterations) break;
                     best = st.best;
+                    idx = st.next++;
+                    st.inFlight.insert(idx);
                 }
+                Rng rng = candRng(st.seed, idx);
                 Stopwatch gen;
                 Cand cand = nextRandom(o, ev.ws, groups, best, rng);
                 gTimes.permute += gen.us();
@@ -687,6 +834,10 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
                     fresh = st.seen.insert(hashCand(cand)).second;
                 }
                 if (!fresh) {
+                    {
+                        std::lock_guard<std::mutex> lk(st.mu);
+                        st.inFlight.erase(idx);
+                    }
                     if (++misses > 2000) break; // nothing new left to try
                     continue;
                 }
@@ -694,7 +845,8 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
                 std::string log;
                 std::vector<Insn> insns;
                 long s = ev.eval(w, cand, log, &insns);
-                if (report(o, ev, st, cand, s, insns, log)) gStop = true;
+                if (gStop && s < 0) break; // interrupted: leave it for a resumed run
+                if (report(o, ev, st, cand, s, insns, log, idx)) gStop = true;
             }
             idle++;
         });
@@ -703,6 +855,8 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
         for (int i = 0; i < 20 && idle < o.jobs; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         printStatus(st);
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
     }
     for (auto& t : workers) t.join();
     return 0;
@@ -727,25 +881,28 @@ void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
 int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
     std::mutex qmu;
     std::condition_variable qcv;
-    std::deque<Cand> queue;
+    std::deque<std::pair<long, Cand>> queue; // candidate index, candidate
     bool done = false;
     long produced = 0;
 
     auto worker = [&](int w) {
         while (true) {
             Cand cand;
+            long idx;
             {
                 std::unique_lock<std::mutex> lk(qmu);
                 qcv.wait(lk, [&] { return !queue.empty() || done || gStop; });
                 if (gStop || (queue.empty() && done)) return;
-                cand = std::move(queue.front());
+                idx = queue.front().first;
+                cand = std::move(queue.front().second);
                 queue.pop_front();
             }
             qcv.notify_all();
             std::string log;
             std::vector<Insn> insns;
             long s = ev.eval(w, cand, log, &insns);
-            if (report(o, ev, st, cand, s, insns, log)) {
+            if (gStop && s < 0) return; // interrupted: leave it for a resumed run
+            if (report(o, ev, st, cand, s, insns, log, idx)) {
                 gStop = true;
                 qcv.notify_all();
             }
@@ -760,15 +917,24 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
         exhaustiveCands(o, ev.ws, groups, [&](const Cand& n, const std::string&) {
             gTimes.generated++;
             if (gStop || produced >= o.maxCandidates) return 0;
+            long idx;
             {
+                // the order doesn't depend on the scores, so a resumed run replays the
+                // earlier candidates (without compiling them) to get the same 'seen'
                 std::lock_guard<std::mutex> lk(st.mu);
+                idx = st.next++;
                 if (!st.seen.insert(hashCand(n)).second) return 2;
+                if (idx < st.resumeFrom) {
+                    produced++;
+                    return 1;
+                }
+                st.inFlight.insert(idx);
             }
             produced++;
             Stopwatch wait;
             std::unique_lock<std::mutex> lk(qmu);
             qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
-            queue.push_back(n);
+            queue.push_back({idx, n});
             qcv.notify_all();
             waited += wait.us();
             return 1;
@@ -790,6 +956,8 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
             if ((done && queue.empty()) || gStop) break;
         }
         printStatus(st);
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
     }
     producer.join();
     {
@@ -1188,8 +1356,32 @@ int main(int argc, char** argv) {
         cleanup();
         return 0;
     }
+    st.key = checkpointKey(o, ws.base);
+    st.seed = o.seedSet ? o.seed : (uint64_t)std::random_device{}();
+    if (o.resume) {
+        if (!loadCheckpoint(o, st, err)) {
+            std::cerr << "error: --resume: " << err << "\n";
+            cleanup();
+            return 1;
+        }
+        if (o.seedSet && o.seed != st.seed)
+            std::cerr << "warning: --seed ignored, resuming with the checkpoint's seed " << st.seed << "\n";
+        std::cout << "resuming at candidate " << st.resumeFrom << " (seed " << st.seed << ", " << st.compiles
+                  << " compiles so far, best " << st.bestScore << ")\n";
+        if (st.bestScore == 0 && !o.keepGoing) {
+            std::cout << "the checkpoint already has a match\n";
+            cleanup();
+            return 0;
+        }
+    } else {
+        std::cout << "seed: " << st.seed << " (resume with --resume, same options)\n";
+    }
     if (o.mode == "random") runRandom(o, ev, st, groups);
     else runExhaustive(o, ev, st, groups);
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
+    }
     cleanup();
 
     std::cout << "\n";
