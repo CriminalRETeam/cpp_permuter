@@ -884,6 +884,7 @@ const std::vector<Pass>& allPasses() {
     };
     registerMorePasses(passes);
     registerManualPasses(passes);
+    registerExtraPasses(passes);
     return passes;
     }();
     return passes;

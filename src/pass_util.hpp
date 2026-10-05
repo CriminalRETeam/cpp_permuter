@@ -74,4 +74,7 @@ std::map<std::string, std::string> localTypes(const Func& f);
 // passes_manual.cpp
 void registerManualPasses(std::vector<Pass>& passes);
 
+// passes_extra.cpp
+void registerExtraPasses(std::vector<Pass>& passes);
+
 } // namespace perm::util

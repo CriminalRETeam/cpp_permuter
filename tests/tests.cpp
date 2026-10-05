@@ -391,6 +391,32 @@ static void testBoolReturn() {
     CHECK(run("int f(int a)\n{\n    return a + 1;\n}\n", "bool_return").empty());
 }
 
+static void testExtraPasses() {
+    auto b = run("void f(u8 k)\n{\n    g = k < 3;\n}\n", "bool_assign");
+    CHECK(any(b, {"if (k < 3)", "g = 1;", "else", "g = 0;"}));
+    CHECK(any(b, {"g = 0;\n    if (k < 3)"}));
+    auto r = run("void f(u8 k)\n{\n    if (k & 0x80)\n        g = 1;\n    else\n        g = 0;\n}\n", "bool_assign");
+    CHECK(any(r, {"g = (k & 0x80) != 0;"}));
+    CHECK(run("void f(u8 k)\n{\n    g = k + 3;\n}\n", "bool_assign").empty());
+
+    const char* two = "void f(P* p)\n{\n    C** a = p->h;\n    a[0] = 0;\n    C** b = p->h + 1;\n    b[0] = p->c;\n}\n";
+    CHECK(any(run(two, "reuse_local"), {"    a = p->h + 1;\n    a[0] = p->c;"}));
+    // a is read again after b's declaration: no reuse
+    CHECK(run("void f(P* p)\n{\n    C* a = p->h;\n    C* b = p->g;\n    a->x = b->x;\n}\n", "reuse_local").empty());
+    // a is read at the top of a loop that assigns b: no reuse
+    CHECK(run("void f(P* p)\n{\n    C* a = p->h;\n    while (p)\n    {\n        g(a);\n        C* b = p->g;\n"
+              "        g(b);\n    }\n}\n", "reuse_local").empty());
+
+    const char* one = "void f(P* p)\n{\n    C** a = p->h;\n    a[0] = 0;\n    a = p->h + 1;\n    a[0] = p->c;\n}\n";
+    CHECK(any(run(one, "split_local"), {"    C** a_2 = p->h + 1;\n    a_2[0] = p->c;"}));
+
+    auto u = run("void f(P* p)\n{\n    C* c = p->c;\n    if (c)\n        c->g();\n}\n", "inline_use");
+    CHECK(any(u, {"C* c = p->c;", "if (p->c)", "c->g();"}));
+    CHECK(any(u, {"if (c)", "p->c->g();"}));
+    // a store between the local and the use: not read again there
+    CHECK(run("void f(P* p)\n{\n    C* c = p->c;\n    g(c);\n    p->c = 0;\n    g(c);\n}\n", "inline_use").size() == 1);
+}
+
 static void testTernaryArg() {
     auto v = run("void f(P* p, int x)\n{\n    p->g(x == 0 ? 1 : 0);\n}\n", "ternary_arg");
     CHECK(any(v, {"if (x == 0)\n    {\n        p->g(1);\n    }\n    else\n    {\n        p->g(0);\n    }"}));
@@ -732,6 +758,7 @@ static void testPassDocs() {
 }
 
 int main() {
+    testExtraPasses();
     testPassDocs();
     testInequalities();
     testChainAssign();

@@ -1050,3 +1050,154 @@ s32 f(s32 a)
 }
 ```
 
+## `bool_assign`
+
+'x = a < b;' <-> 'if (a < b) x = 1; else x = 0;' (or 'x = 0; if (a < b) x = 1;'), and 'if (a & 8) x = 1; else x = 0;' -> 'x = (a & 8) != 0;'.
+
+```cpp
+void f(u8 keys)
+{
+    gAltDown = (keys & 0x80) != 0;
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = 1;
+    }
+    else
+    {
+        gAltDown = 0;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    gAltDown = 0;
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = 1;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = true;
+    }
+    else
+    {
+        gAltDown = false;
+    }
+}
+```
+
+(4 candidates in all for this function.)
+
+## `reuse_local`
+
+Reuse a dead local of the same type for a later one: 'T* b = y;' -> 'a = y;' with b's uses renamed (one variable or two decides which register or slot holds it).
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** b = p->history + 1;
+    b[0] = p->car;
+}
+```
+
+becomes
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+}
+```
+
+## `split_local`
+
+Give a local's later value its own variable: 'a = y;' -> 'T a_2 = y;' with the uses after it renamed (the reverse of reuse_local).
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+}
+```
+
+becomes
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** a_2 = p->history + 1;
+    a_2[0] = p->car;
+}
+```
+
+## `inline_use`
+
+Read a local's (side effect free) initializer again at one of its uses instead of the local: 'T x = p->f; a(x); b(x);' -> 'T x = p->f; a(x); b(p->f);'.
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        car->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (p->car)
+    {
+        car->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        p->car->Stop();
+    }
+}
+```
+

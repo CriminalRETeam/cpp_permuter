@@ -246,6 +246,32 @@ const std::vector<Sample>& samples() {
 {
     return a * 8;
 })", {0}},
+        {"bool_assign", R"(void f(u8 keys)
+{
+    gAltDown = (keys & 0x80) != 0;
+})", {0, 1, 2}},
+        {"reuse_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** b = p->history + 1;
+    b[0] = p->car;
+})", {0}},
+        {"split_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+})", {0}},
+        {"inline_use", R"(void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        car->Stop();
+    }
+})", {0, 1}},
     };
     return s;
 }
