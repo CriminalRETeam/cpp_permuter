@@ -757,6 +757,28 @@ static void testPassDocs() {
     for (auto& p : allPasses()) CHECK(contains(gen, "## `" + p.name + "`"));
 }
 
+static void testConventionRegions() {
+    auto dir = std::filesystem::temp_directory_path() / "perm_cc_test";
+    std::filesystem::create_directories(dir);
+    std::string h = (dir / "a.hpp").string(), c = (dir / "a.cpp").string();
+    std::ofstream(h) << "struct K\n{\n    EXPORT static s32 Get();\n};\nchar __stdcall Set(int a);\n";
+    std::ofstream(c) << "s32 K::Get()\n{\n    return Set(1);\n}\n";
+    auto rs = perm::conventionRegions({c, h}, {"Get", "Set"}, 0);
+    CHECK(rs.size() == 3);
+    int get = -1, set = -1;
+    for (auto& r : rs) {
+        CHECK(r.alts.size() == 4);
+        if (r.name == "convention Get") {
+            CHECK(get < 0 || get == r.link);
+            get = r.link;
+        } else {
+            set = r.link;
+        }
+    }
+    CHECK(get >= 0 && set >= 0 && get != set);
+    std::filesystem::remove_all(dir);
+}
+
 int main() {
     testExtraPasses();
     testPassDocs();
@@ -792,6 +814,7 @@ int main() {
     testEffects();
     testReorderSaves();
     testInlineLocal();
+    testConventionRegions();
     testSinkHoistMerge();
     testExprPasses();
     testExprParser();

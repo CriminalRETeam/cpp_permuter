@@ -21,6 +21,12 @@ struct Region {
     // A global's declaration rather than a function: the other form of the line
     // (the extern declaration of a definition, or the definition of an extern).
     std::string alt;
+    // A calling convention site (--calling-conventions): the text between a declaration's return
+    // type and its name. alts are the four choices (none, __cdecl, __stdcall, __fastcall); regions
+    // with the same link (the declarations of one function) always hold the same choice.
+    std::vector<std::string> alts;
+    int link = -1;
+    bool isToggle() const { return !alt.empty() || !alts.empty(); }
 };
 
 // Names of the functions called in f's body (the last component: "GetX" for
@@ -47,6 +53,13 @@ std::vector<Region> inlineCallees(const std::string& srcPath, size_t mainStart, 
 std::vector<Region> globalRegions(const std::string& srcPath, const std::string& srcText,
                                   const std::set<std::string>& names, const std::string& definePrefix,
                                   const std::string& externPrefix);
+
+// The calling convention sites of the functions named in `names` (declarations and definitions
+// in `files`), for --calling-conventions. A site is "<return type> [convention] [Class::]name(" at
+// the start of a line; its region is the text between the return type and the name. Sites of one
+// name share a link number, starting at firstLink.
+std::vector<Region> conventionRegions(const std::vector<std::string>& files,
+                                      const std::set<std::string>& names, int firstLink);
 
 std::string spliceRegions(const std::string& original,
                           std::vector<std::pair<const Region*, const std::string*>> parts);
