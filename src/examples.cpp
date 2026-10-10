@@ -292,6 +292,29 @@ const std::vector<Sample>& samples() {
     f32 v = s * 2.0f + p->speed;
     p->speed = v;
 })", {0, 2}},
+        {"goto_exit", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            break;
+        }
+    }
+    p->Stop();
+})", {0}},
+        {"tail_return", R"(int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+})", {0}},
     };
     return s;
 }

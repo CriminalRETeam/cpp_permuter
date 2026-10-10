@@ -1305,3 +1305,77 @@ void f(Ped* p, f32 s)
 
 (3 candidates in all for this function.)
 
+## `goto_exit`
+
+'break;' <-> 'goto loop_exit;' with the label after the loop (all breaks or one): a break's exit is a jump-only block whose jumps VC6 retargets.
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            break;
+        }
+    }
+    p->Stop();
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto loop_exit;
+        }
+    }
+    loop_exit:
+    p->Stop();
+}
+```
+
+## `tail_return`
+
+Copy the return after an if into the end of one branch ('return;' for an if that ends a void function), or drop such a copy: which tail VC6's cross-jumping keeps.
+
+```cpp
+int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+}
+```
+
+becomes
+
+```cpp
+int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+        return p->b;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+}
+```
+
+(2 candidates in all for this function.)
+

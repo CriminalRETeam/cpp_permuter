@@ -140,6 +140,113 @@ void enumNoopNode(const Func& f, const EmitFn& emit) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// goto_exit: 'break;' -> 'goto loop_exit;' with the label after the loop, and back. A break
+// makes the exit a jump-only block whose jumps VC6 retargets; a label with code keeps it.
+
+namespace {
+
+bool isBreakable(const Stmt& s) {
+    return s.kind == SK::For || s.kind == SK::While || s.kind == SK::Do || s.kind == SK::Switch;
+}
+
+// The innermost loop or switch holding s, or null.
+const Stmt* breakTarget(const Stmt* s) {
+    for (const Stmt* p = s->parent; p; p = p->parent)
+        if (isBreakable(*p)) return p;
+    return nullptr;
+}
+
+bool usesToken(const Func& f, const std::string& t) {
+    for (auto& tk : f.toks)
+        if (tk.text == t) return true;
+    return false;
+}
+
+} // namespace
+
+void enumGotoExit(const Func& f, const EmitFn& emit) {
+    std::string label = "loop_exit";
+    for (int n = 2; usesToken(f, label); ++n) label = "loop_exit_" + std::to_string(n);
+    std::vector<const Stmt*> loops;
+    forEachStmt(*f.body, [&](const Stmt& s) {
+        if (s.kind == SK::For || s.kind == SK::While || s.kind == SK::Do) loops.push_back(&s);
+    });
+    for (const Stmt* L : loops) {
+        if (!inBlock(*L)) continue;
+        std::vector<const Stmt*> brks;
+        forEachStmt(*L, [&](const Stmt& s) {
+            if (s.kind == SK::Break && breakTarget(&s) == L) brks.push_back(&s);
+        });
+        if (brks.empty()) continue;
+        auto& sib = L->parent->kids;
+        int i = indexInParent(*L);
+        int at = i + 1 < (int)sib.size() ? sib[i + 1]->begin : L->parent->end - 1;
+        std::string lab = label + (i + 1 < (int)sib.size() ? ":" : ":;");
+        // all breaks, then each one alone
+        std::vector<std::vector<const Stmt*>> picks{brks};
+        if (brks.size() > 1)
+            for (auto* b : brks) picks.push_back({b});
+        for (auto& pick : picks) {
+            if (!emit([&f, pick, at, lab, label]() {
+                    Rewriter rw(f);
+                    for (auto* b : pick) rw.replace(b->begin, b->end, "goto " + label + ";");
+                    rw.insertBefore(at, lab);
+                    return rw.apply();
+                }))
+                return;
+        }
+    }
+    // back: 'goto L;' -> 'break;' when L labels the statement right after the loop it is in
+    for (const Stmt* g : stmtsOfKind(f, SK::Goto)) {
+        if (g->end - g->begin != 3) continue;
+        const Stmt* L = breakTarget(g);
+        if (!L || L->kind == SK::Switch || !inBlock(*L)) continue;
+        auto& sib = L->parent->kids;
+        int i = indexInParent(*L);
+        if (i + 1 >= (int)sib.size() || sib[i + 1]->kind != SK::Label) continue;
+        if (f.t(sib[i + 1]->begin) != f.t(g->begin + 1)) continue;
+        if (!emitReplace(f, emit, g->begin, g->end, "break;")) return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tail_return: 'if (c) A else B  return e;' -> 'if (c) { A return e; } else B  return e;' (one
+// branch at a time; 'return;' after an if that ends a void function), and back. Which copy of
+// a return VC6 keeps when it cross-jumps the tails depends on them.
+
+void enumTailReturn(const Func& f, const EmitFn& emit) {
+    // the text starts at the name, so a void function is told by its returns: none with a value
+    bool isVoid = true;
+    for (const Stmt* r : stmtsOfKind(f, SK::Return)) isVoid &= r->end - r->begin == 2;
+    for (const Stmt* s : stmtsOfKind(f, SK::If)) {
+        if (!inBlock(*s)) continue;
+        auto& sib = s->parent->kids;
+        int i = indexInParent(*s);
+        std::string ret;
+        if (i + 1 < (int)sib.size() && sib[i + 1]->kind == SK::Return && i + 2 == (int)sib.size())
+            ret = f.textOf(*sib[i + 1]);
+        else if (i + 1 == (int)sib.size() && s->parent == f.body.get() && isVoid)
+            ret = "return;";
+        if (ret.empty()) continue;
+        for (size_t k = 0; k < s->kids.size(); ++k) {
+            const Stmt* b = s->kids[k].get();
+            if (b->kind == SK::If) continue; // else-if chain: the inner if gets its own turn
+            auto st = branchStmts(b);
+            if (!st.empty() && isJump(st.back())) {
+                // drop a copy that equals the trailing return
+                if (norm(f.textOf(*st.back())) == norm(ret) && st.size() > 1 &&
+                    !emitReplace(f, emit, b->begin, b->end,
+                                 blockText(f, {st.begin(), st.end() - 1}, lineInd(f, s->begin))))
+                    return;
+                continue;
+            }
+            if (!emitReplace(f, emit, b->begin, b->end, blockText(f, st, lineInd(f, s->begin), {}, {ret})))
+                return;
+        }
+    }
+}
+
 void registerVc6Passes(std::vector<Pass>& passes) {
     passes.push_back({"swap_logical",
                       "'a && b' <-> 'b && a' (and ||) when neither side has side effects (calls are "
@@ -153,6 +260,15 @@ void registerVc6Passes(std::vector<Pass>& passes) {
                       "Add or drop parentheses that change nothing, or an '(f32)' cast of an f32 "
                       "value: no-op tree nodes move the x87 scheduler's 81-node windows",
                       5, enumNoopNode, nullptr});
+    passes.push_back({"goto_exit",
+                      "'break;' <-> 'goto loop_exit;' with the label after the loop (all breaks or one): "
+                      "a break's exit is a jump-only block whose jumps VC6 retargets",
+                      5, enumGotoExit, nullptr});
+    passes.push_back({"tail_return",
+                      "Copy the return after an if into the end of one branch ('return;' for an if "
+                      "that ends a void function), or drop such a copy: which tail VC6's "
+                      "cross-jumping keeps",
+                      5, enumTailReturn, nullptr});
 }
 
 } // namespace util
