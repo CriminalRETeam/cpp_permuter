@@ -82,6 +82,10 @@ Other functions (for helpers VC6 inlines into the target):
       --op-alias OP=NAME    for named_op: operator OP ("*", "+", ..., "neg" for unary
                             minus) also exists as the method NAME, e.g.
                             "*=Multiply_408680". Repeatable
+      --auto-method-aliases for named_op: each method "Name" the function calls that also
+                            exists as "Name_ADDRESS" (or the other way round) is an
+                            alias, like --op-alias Name=Name_ADDRESS: an inline method and
+                            its named out-of-line copy (an OP can also be a method name)
       --inline-callees      also permute the inline functions the target calls: their
                             definitions in the source (if marked inline) and in the
                             headers it includes
@@ -153,6 +157,7 @@ struct Options {
     std::vector<std::string> also, includeDirs, checkParse, opAliases;
     bool externGlobals = false;
     bool callingConventions = false;
+    bool autoMethodAliases = false;
     std::string globalMacros = "DEFINE_GLOBAL=EXTERN_GLOBAL";
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
@@ -238,6 +243,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "inline-callees") return o.inlineCallees = true;
     if (key == "extern-globals") return o.externGlobals = true;
     if (key == "calling-conventions") return o.callingConventions = true;
+    if (key == "auto-method-aliases") return o.autoMethodAliases = true;
     if (key == "global-macros") return need() && (o.globalMacros = val, true);
     if (key == "max-callees") return num(o.maxCallees);
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
@@ -260,7 +266,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals", "calling-conventions",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals", "calling-conventions", "auto-method-aliases",
     };
     return flags.count(k) > 0;
 }
@@ -1375,6 +1381,38 @@ int main(int argc, char** argv) {
                 return 1;
             }
             as.push_back({spec.substr(0, eq), spec.substr(eq + 1)});
+        }
+        if (o.autoMethodAliases) {
+            // "Name" and "Name_4086A0" both declared in the source or its headers, and one of them
+            // called by the function: an inline method and its named out-of-line copy
+            std::set<std::string> declared;
+            std::vector<std::string> files = {srcPath};
+            for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+            for (auto& file : files) {
+                std::string text;
+                if (!readFile(file, text)) continue;
+                auto toks = lex(text);
+                for (size_t i = 0; i + 1 < toks.size(); ++i)
+                    if (toks[i].kind == TokKind::Ident && toks[i + 1].text == "(") declared.insert(toks[i].text);
+            }
+            std::set<std::string> called;
+            for (auto& r : ws.regions)
+                if (!r.isToggle()) {
+                    std::string ferr;
+                    auto fn = parseFunc(ws.base[&r - &ws.regions[0]], ferr);
+                    if (fn)
+                        for (auto& n : calledNames(*fn)) called.insert(n);
+                }
+            for (auto& n : declared) {
+                if (n.size() < 8 || n[n.size() - 7] != '_') continue;
+                bool hex = true;
+                for (size_t i = n.size() - 6; i < n.size(); ++i) hex &= std::isxdigit((unsigned char)n[i]) != 0;
+                std::string base = n.substr(0, n.size() - 7);
+                if (!hex || base.empty() || !declared.count(base)) continue;
+                if (!called.count(n) && !called.count(base)) continue;
+                as.push_back({base, n});
+                if (o.verbose) std::cout << "method alias: " << base << " = " << n << "\n";
+            }
         }
         setOpAliases(as);
     }

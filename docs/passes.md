@@ -1379,3 +1379,42 @@ int f(Ped* p)
 
 (2 candidates in all for this function.)
 
+## `switch_dup`
+
+Run the statement after a switch in each case before its break (adding a default for it if there is none), or hoist a statement every break shares out of the switch: per-case tails.
+
+```cpp
+void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            break;
+        default:
+            p->x++;
+            break;
+    }
+    p->n++;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            p->n++;
+            break;
+        default:
+            p->x++;
+            p->n++;
+            break;
+    }
+}
+```
+

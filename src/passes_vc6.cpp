@@ -247,6 +247,81 @@ void enumTailReturn(const Func& f, const EmitFn& emit) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// switch_dup: 'switch (x) { case 1: A; break; ... } S;' -> each case runs S before its break (a
+// default that only runs S is added if there is none), and back
+
+void enumSwitchDup(const Func& f, const EmitFn& emit) {
+    for (const Stmt* s : stmtsOfKind(f, SK::Switch)) {
+        if (!inBlock(*s) || s->kids.empty() || s->kids[0]->kind != SK::Block) continue;
+        const Stmt* body = s->kids[0].get();
+        auto& sib = s->parent->kids;
+        int i = indexInParent(*s);
+        if (i + 1 >= (int)sib.size()) continue;
+        const Stmt* n = sib[i + 1].get();
+        if (n->kind != SK::Expr) continue;
+        std::string stmt = f.textOf(*n);
+        std::vector<const Stmt*> brks;
+        bool hasDefault = false;
+        forEachStmt(*body, [&](const Stmt& x) {
+            if (x.kind == SK::Break && breakTarget(&x) == s) brks.push_back(&x);
+            if (x.kind == SK::Default && x.parent == body) hasDefault = true;
+        });
+        const Stmt* last = body->kids.empty() ? nullptr : body->kids.back().get();
+        bool fallsOut = last && !isJump(last);
+        std::string ind = lineInd(f, s->begin);
+        if (!emit([&f, brks, n, stmt, fallsOut, hasDefault, body, ind]() {
+                Rewriter rw(f);
+                for (auto* b : brks) rw.replace(b->begin, b->end, stmt + "\n" + lineInd(f, b->begin) + "break;");
+                std::string tail;
+                if (fallsOut) tail += "    " + stmt + "\n" + ind + "    break;\n" + ind;
+                if (!hasDefault) tail += "default:\n" + ind + "    " + stmt + "\n" + ind + "    break;\n" + ind;
+                if (!tail.empty()) rw.insertBefore(body->end - 1, tail.substr(0, tail.size() - ind.size() - 1));
+                rw.remove(n->begin, n->end);
+                return rw.apply();
+            }))
+            return;
+    }
+    // back: every break of the switch preceded by the same statement -> once after the switch
+    for (const Stmt* s : stmtsOfKind(f, SK::Switch)) {
+        if (!inBlock(*s) || s->kids.empty() || s->kids[0]->kind != SK::Block) continue;
+        const Stmt* body = s->kids[0].get();
+        std::vector<const Stmt*> brks;
+        forEachStmt(*body, [&](const Stmt& x) {
+            if (x.kind == SK::Break && breakTarget(&x) == s) brks.push_back(&x);
+        });
+        if (brks.size() < 2) continue;
+        // values with no case, or a last case that falls out, must not start running it
+        bool hasDefault = false;
+        for (auto& k : body->kids) hasDefault |= k->kind == SK::Default;
+        if (!hasDefault || body->kids.empty() || !isJump(body->kids.back().get())) continue;
+        std::string common;
+        std::vector<const Stmt*> prev;
+        bool ok = true;
+        for (auto* b : brks) {
+            int k = indexInParent(*b);
+            if (k <= 0 || b->parent->kids[k - 1]->kind != SK::Expr) {
+                ok = false;
+                break;
+            }
+            const Stmt* p = b->parent->kids[k - 1].get();
+            if (common.empty()) common = norm(f.textOf(*p));
+            ok &= norm(f.textOf(*p)) == common;
+            prev.push_back(p);
+        }
+        if (!ok) continue;
+        std::string text = f.textOf(*prev[0]);
+        if (!emit([&f, prev, s, text]() {
+                Rewriter rw(f);
+                for (auto* p : prev) rw.remove(p->begin, p->end);
+                std::string t = f.tokText(s->end - 1, s->end) + "\n" + lineInd(f, s->begin) + text;
+                rw.replace(s->end - 1, s->end, t);
+                return rw.apply();
+            }))
+            return;
+    }
+}
+
 void registerVc6Passes(std::vector<Pass>& passes) {
     passes.push_back({"swap_logical",
                       "'a && b' <-> 'b && a' (and ||) when neither side has side effects (calls are "
@@ -269,6 +344,11 @@ void registerVc6Passes(std::vector<Pass>& passes) {
                       "that ends a void function), or drop such a copy: which tail VC6's "
                       "cross-jumping keeps",
                       5, enumTailReturn, nullptr});
+    passes.push_back({"switch_dup",
+                      "Run the statement after a switch in each case before its break (adding a "
+                      "default for it if there is none), or hoist a statement every break shares out "
+                      "of the switch: per-case tails",
+                      4, enumSwitchDup, nullptr});
 }
 
 } // namespace util

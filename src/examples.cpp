@@ -315,6 +315,19 @@ const std::vector<Sample>& samples() {
     }
     return p->b;
 })", {0}},
+        {"switch_dup", R"(void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            break;
+        default:
+            p->x++;
+            break;
+    }
+    p->n++;
+})", {0}},
     };
     return s;
 }
