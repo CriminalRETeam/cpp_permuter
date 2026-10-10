@@ -272,6 +272,26 @@ const std::vector<Sample>& samples() {
         car->Stop();
     }
 })", {0, 1}},
+        {"swap_logical", R"(void f(Ped* p, int n)
+{
+    if (n > 0 && p->car != 0)
+    {
+        p->Stop();
+    }
+})", {0}},
+        {"do_while", R"(void f(Ped* p, int n)
+{
+    while (n < p->count)
+    {
+        p->Step(n);
+        n++;
+    }
+})", {0, 1}},
+        {"noop_node", R"(void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = v;
+})", {0, 2}},
     };
     return s;
 }

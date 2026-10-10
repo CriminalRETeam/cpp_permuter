@@ -77,4 +77,7 @@ void registerManualPasses(std::vector<Pass>& passes);
 // passes_extra.cpp
 void registerExtraPasses(std::vector<Pass>& passes);
 
+// passes_vc6.cpp
+void registerVc6Passes(std::vector<Pass>& passes);
+
 } // namespace perm::util

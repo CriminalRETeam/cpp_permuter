@@ -1201,3 +1201,107 @@ void f(Ped* p)
 }
 ```
 
+## `swap_logical`
+
+'a && b' <-> 'b && a' (and ||) when neither side has side effects (calls are allowed: read the diff): which test VC6 lays out first.
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (n > 0 && p->car != 0)
+    {
+        p->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (p->car != 0 && n > 0)
+    {
+        p->Stop();
+    }
+}
+```
+
+## `do_while`
+
+'while (c) B' <-> 'if (c) { do B while (c); }', and 'while (c) B' -> 'do B while (c);' (only if the loop always runs once: read the diff).
+
+```cpp
+void f(Ped* p, int n)
+{
+    while (n < p->count)
+    {
+        p->Step(n);
+        n++;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (n < p->count)
+    {
+        do
+        {
+            p->Step(n);
+            n++;
+        } while (n < p->count);
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    do
+    {
+        p->Step(n);
+        n++;
+    } while (n < p->count);
+}
+```
+
+## `noop_node`
+
+Add or drop parentheses that change nothing, or an '(f32)' cast of an f32 value: no-op tree nodes move the x87 scheduler's 81-node windows.
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = v;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = (s * 2.0f) + p->speed;
+    p->speed = v;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = (f32)v;
+}
+```
+
+(3 candidates in all for this function.)
+
