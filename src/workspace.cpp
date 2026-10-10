@@ -358,6 +358,13 @@ std::vector<Region> conventionRegions(const std::vector<std::string>& files,
                     toks.push_back({b, i});
                 }
                 if (toks.empty()) continue; // a call statement or a constructor
+                // constructors: only specifiers before the name, or 'X::X('
+                static const std::set<std::string> kSpec = {"inline", "__inline", "__forceinline", "explicit",
+                                                            "static", "virtual", "extern"};
+                bool onlySpec = true;
+                for (auto& t : toks) onlySpec &= kSpec.count(prefix.substr(t.first, t.second - t.first)) > 0;
+                if (onlySpec) continue;
+                if (q < at && text.compare(q, name.size(), name) == 0 && at - q == name.size() + 2) continue;
                 std::string first = prefix.substr(toks[0].first, toks[0].second - toks[0].first);
                 if (kNotType.count(first)) continue;
                 size_t rb; // region start in prefix: after the return type
