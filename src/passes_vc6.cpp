@@ -322,6 +322,80 @@ void enumSwitchDup(const Func& f, const EmitFn& emit) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// dead_wrap: 'for (...) B  ...  return;' -> 'while (1) { for (...) B ... return; }' (or 'if (1)'),
+// and back. The never-taken exit edge of the wrapper changes which successor VC6's RPO walk visits
+// first, so code reached by a goto out of the loop can be laid out before the loop's normal tail
+// (gta2_re Object_2C::IntegrateHorizontalMovementAndCollisions_524630).
+
+namespace {
+
+const Stmt* continueTarget(const Stmt* s) {
+    for (const Stmt* p = s->parent; p; p = p->parent)
+        if (p->kind == SK::For || p->kind == SK::While || p->kind == SK::Do) return p;
+    return nullptr;
+}
+
+bool isConstTrue(const Func& f, const Stmt& s) {
+    if (s.condOpen < 0 || s.condClose != s.condOpen + 2) return false;
+    std::string c = f.t(s.condOpen + 1);
+    return c == "1" || c == "true";
+}
+
+} // namespace
+
+void enumDeadWrap(const Func& f, const EmitFn& emit) {
+    std::vector<const Stmt*> loops;
+    forEachStmt(*f.body, [&](const Stmt& s) {
+        if (s.kind == SK::For || s.kind == SK::While || s.kind == SK::Do) loops.push_back(&s);
+    });
+    for (const Stmt* L : loops) {
+        if (!inBlock(*L) || isConstTrue(f, *L)) continue;
+        auto& sib = L->parent->kids;
+        int i = indexInParent(*L);
+        int j = i;
+        while (j < (int)sib.size() && sib[j]->kind != SK::Return && sib[j]->kind != SK::Goto) ++j;
+        if (j >= (int)sib.size()) continue;
+        int b = sib[i]->begin, e = sib[j]->end;
+        bool ok = true;
+        for (int k = i; k <= j && ok; ++k)
+            forEachStmt(*sib[k], [&](const Stmt& s) {
+                const Stmt* t = s.kind == SK::Break ? breakTarget(&s)
+                              : s.kind == SK::Continue ? continueTarget(&s) : &s;
+                if (!t || t->begin < b || t->end > e) ok = false;
+            });
+        if (!ok) continue;
+        int at = j + 1 < (int)sib.size() ? sib[j + 1]->begin : L->parent->end - 1;
+        for (const char* head : {"while (1) {", "if (1) {"}) {
+            if (!emit([&f, b, at, head]() {
+                    Rewriter rw(f);
+                    rw.insertBefore(b, head);
+                    rw.insertBefore(at, "}");
+                    return rw.apply();
+                }))
+                return;
+        }
+    }
+    // back: unwrap 'while (1) { ...; return; }' / 'if (1) { ... }' that nothing breaks out of
+    for (SK k : {SK::While, SK::If}) {
+        for (const Stmt* w : stmtsOfKind(f, k)) {
+            if (!inBlock(*w) || !isConstTrue(f, *w) || w->kids.size() != 1) continue;
+            auto st = branchStmts(w->kids[0].get());
+            if (st.empty()) continue;
+            if (k == SK::While && st.back()->kind != SK::Return && st.back()->kind != SK::Goto) continue;
+            bool ok = true;
+            if (k == SK::While)
+                forEachStmt(*w->kids[0], [&](const Stmt& s) {
+                    if ((s.kind == SK::Break && breakTarget(&s) == w) ||
+                        (s.kind == SK::Continue && continueTarget(&s) == w))
+                        ok = false;
+                });
+            if (!ok) continue;
+            if (!emitReplace(f, emit, w->begin, w->end, stmtsText(f, st, lineInd(f, w->begin)))) return;
+        }
+    }
+}
+
 void registerVc6Passes(std::vector<Pass>& passes) {
     passes.push_back({"swap_logical",
                       "'a && b' <-> 'b && a' (and ||) when neither side has side effects (calls are "
@@ -349,6 +423,10 @@ void registerVc6Passes(std::vector<Pass>& passes) {
                       "default for it if there is none), or hoist a statement every break shares out "
                       "of the switch: per-case tails",
                       4, enumSwitchDup, nullptr});
+    passes.push_back({"dead_wrap",
+                      "Wrap a loop and the statements after it up to a return/goto in 'while (1) { }' "
+                      "or 'if (1) { }', or unwrap one: the dead exit edge changes VC6's RPO block order",
+                      3, enumDeadWrap, nullptr});
 }
 
 } // namespace util

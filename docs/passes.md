@@ -1379,6 +1379,50 @@ int f(Ped* p)
 
 (2 candidates in all for this function.)
 
+## `dead_wrap`
+
+Wrap a loop and the statements after it up to a return/goto in 'while (1) { }' or 'if (1) { }', or unwrap one: the dead exit edge changes VC6's RPO block order.
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+hit:
+    p->Bounce();
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    while (1) {
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+}
+hit:
+    p->Bounce();
+}
+```
+
+(2 candidates in all for this function.)
+
 ## `switch_dup`
 
 Run the statement after a switch in each case before its break (adding a default for it if there is none), or hoist a statement every break shares out of the switch: per-case tails.

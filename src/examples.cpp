@@ -315,6 +315,20 @@ const std::vector<Sample>& samples() {
     }
     return p->b;
 })", {0}},
+        {"dead_wrap", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+hit:
+    p->Bounce();
+})", {0}},
         {"switch_dup", R"(void f(Ped* p, int d)
 {
     switch (d)
