@@ -69,7 +69,7 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output. The output is kept as `score_output.txt` with each improvement, so a scorer can print its own asm diff |
 | `--op-alias OP=NAME` | for `named_op`: operator `OP` (`*`, `+`, ..., `neg`) also exists as the method `NAME`. Repeatable |
 | `--ignore-reloc-names` | compare relocated operands without their symbol names, and treat absolute addresses as symbols. Use this when the target came from raw exe asm |
-| `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count |
+| `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count (0 = no limit) |
 | `-m random` | (default) apply 1..`--max-mutations` random passes or combos, starting from the base or from the best so far. Runs until a match, `-n` compiles, or Ctrl-C |
 | `-p a,b` | passes to use (default: all). `-p` can be repeated. `a+b` combines passes, see below |
 | `-j N` | parallel compiles |

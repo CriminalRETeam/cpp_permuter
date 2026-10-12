@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -63,7 +64,7 @@ Search:
                             separate passes, '+' combines them: "a+b" tries a, b and
                             a then b. Can be given more than once
       --depth N             exhaustive: chain up to N passes/combos (default 1)
-      --max-candidates N    exhaustive: stop after N candidates (default 200000)
+      --max-candidates N    exhaustive: stop after N candidates (default 200000, 0 = no limit)
   -n, --iterations N        random: stop after N compiles (default: run until match/Ctrl-C)
       --max-mutations N     random: up to N passes/combos per candidate (default 3)
       --keep-prob P         random: start from the best candidate so far with
@@ -1186,6 +1187,7 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << err << "\n\n" << kUsage;
         return 2;
     }
+    if (o.maxCandidates <= 0) o.maxCandidates = LONG_MAX;  // --max-candidates 0: no limit
     if (o.listPasses) {
         for (auto& p : allPasses()) std::cout << "  " << p.name << "\n      " << p.description << "\n";
         return 0;
