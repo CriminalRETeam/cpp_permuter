@@ -5,6 +5,7 @@
 #include "parser.hpp"
 
 #include <functional>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -38,6 +39,22 @@ struct Getter {
 std::vector<Getter> findGetters(const std::string& text);
 void setGetters(std::vector<Getter> g); // before the passes run
 const std::vector<Getter>& getters();
+
+// An operator that also exists as a named (out-of-line) method: "*" -> "Multiply_408680",
+// "neg" (unary minus) -> "Negate_4086A0". named_op swaps between the two, which decides
+// whether VC6 inlines it. Set with --op-alias OP=NAME.
+struct OpAlias {
+    std::string op, method;
+};
+void setOpAliases(std::vector<OpAlias> a); // before the passes run
+const std::vector<OpAlias>& opAliases();
+
+// Declared types of the members (and other one-per-line declarations) in the
+// source and the headers it includes, by name: "field_7C_pObj" -> "Object_2C*".
+// Names declared with different types are left out. cache_member uses these.
+std::map<std::string, std::string> findFieldTypes(const std::string& text);
+void setFieldTypes(std::map<std::string, std::string> t); // before the passes run
+const std::map<std::string, std::string>& fieldTypes();
 
 // A pass, or a combination of passes written "a+b+c" on the command line.
 struct PassGroup {

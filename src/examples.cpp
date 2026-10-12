@@ -208,11 +208,140 @@ const std::vector<Sample>& samples() {
 {
     g((u8)p->a);
 })", {0}},
+        {"named_op", R"(Fix16 f(Fix16 a, Fix16 b)
+{
+    return -a * b;
+})", {0, 1}},
+        {"cast_operand", R"(u32 f(s32 a, u8 b)
+{
+    return a / b;
+})", {0, 6}},
         {"remove_stmt", R"(void f(Ped* p)
 {
     g();
     WIP_IMPLEMENTED;
 })", {1}},
+        {"cache_member", R"(void f(Ped* p)
+{
+    g(p->field_8_car);
+    h(p->field_8_car);
+})", {0, 1}},
+        {"ref_local", R"(void f(Ped* p)
+{
+    Fix16 x = p->GetX();
+    g(x);
+})", {0}},
+        {"incdec", R"(void f(Ped* p)
+{
+    p->count++;
+})", {0, 1}},
+        {"cond_temp", R"(void f(Ped* p)
+{
+    if (p->a && p->b)
+    {
+        g();
+    }
+})", {0}},
+        {"pow2_shift", R"(s32 f(s32 a)
+{
+    return a * 8;
+})", {0}},
+        {"bool_assign", R"(void f(u8 keys)
+{
+    gAltDown = (keys & 0x80) != 0;
+})", {0, 1, 2}},
+        {"reuse_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** b = p->history + 1;
+    b[0] = p->car;
+})", {0}},
+        {"split_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+})", {0}},
+        {"inline_use", R"(void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        car->Stop();
+    }
+})", {0, 1}},
+        {"swap_logical", R"(void f(Ped* p, int n)
+{
+    if (n > 0 && p->car != 0)
+    {
+        p->Stop();
+    }
+})", {0}},
+        {"do_while", R"(void f(Ped* p, int n)
+{
+    while (n < p->count)
+    {
+        p->Step(n);
+        n++;
+    }
+})", {0, 1}},
+        {"noop_node", R"(void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = v;
+})", {0, 2}},
+        {"goto_exit", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            break;
+        }
+    }
+    p->Stop();
+})", {0}},
+        {"tail_return", R"(int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+})", {0}},
+        {"dead_wrap", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+hit:
+    p->Bounce();
+})", {0}},
+        {"switch_dup", R"(void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            break;
+        default:
+            p->x++;
+            break;
+    }
+    p->n++;
+})", {0}},
     };
     return s;
 }
@@ -236,12 +365,17 @@ std::string passExamplesMarkdown() {
          "passes also work in the other direction.\n\n";
     // use_getter needs a getter to know about
     setGetters({{"get_cam_x", "field_1AC_cam.x"}});
+    setFieldTypes({{"field_8_car", "Car_BC*"}});
+    // named_op needs to know the named versions of the operators
+    setOpAliases({{"*", "Multiply_408680"}, {"neg", "Negate_4086A0"}});
     for (auto& s : samples()) {
         const Pass* p = findPass(s.pass);
         if (!p) continue;
         o << "## `" << s.pass << "`\n\n" << p->description << ".\n\n";
         if (std::string(s.pass) == "use_getter")
             o << "With `Fix16 get_cam_x() { return field_1AC_cam.x; }` in an included header:\n\n";
+        if (std::string(s.pass) == "named_op")
+            o << "With `--op-alias '*=Multiply_408680' --op-alias neg=Negate_4086A0`:\n\n";
         std::string err;
         auto f = parseFunc(s.code, err);
         std::vector<std::string> outs;
@@ -264,6 +398,7 @@ std::string passExamplesMarkdown() {
             o << "(" << outs.size() << " candidates in all for this function.)\n\n";
     }
     setGetters({});
+    setFieldTypes({});
     return o.str();
 }
 

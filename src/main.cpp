@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -51,7 +52,8 @@ Scoring:
                             (default: guessed from --function)
       --target-symbol SYM   symbol in the target object (default: same as --symbol)
       --score-cmd CMD       score with this command instead ({obj}, {src}); it must
-                            print the score (lower is better, 0 = match) as its last number
+                            print the score (lower is better, 0 = match) as its last number.
+                            Its output is kept as score_output.txt with each improvement
       --objdump PATH        llvm-objdump to use (default: llvm-objdump)
       --ignore-reloc-names  compare relocated operands without their symbol names
                             (for targets built from raw executable asm)
@@ -62,7 +64,7 @@ Search:
                             separate passes, '+' combines them: "a+b" tries a, b and
                             a then b. Can be given more than once
       --depth N             exhaustive: chain up to N passes/combos (default 1)
-      --max-candidates N    exhaustive: stop after N candidates (default 200000)
+      --max-candidates N    exhaustive: stop after N candidates (default 200000, 0 = no limit)
   -n, --iterations N        random: stop after N compiles (default: run until match/Ctrl-C)
       --max-mutations N     random: up to N passes/combos per candidate (default 3)
       --keep-prob P         random: start from the best candidate so far with
@@ -78,10 +80,29 @@ Other functions (for helpers VC6 inlines into the target):
       --also [FILE:]NAME    also permute this function. FILE is relative to the current
                             directory or the source's; without it NAME is looked up in
                             the source and the headers it includes. Repeatable
+      --op-alias OP=NAME    for named_op: operator OP ("*", "+", ..., "neg" for unary
+                            minus) also exists as the method NAME, e.g.
+                            "*=Multiply_408680". Repeatable
+      --auto-method-aliases for named_op: each method "Name" the function calls that also
+                            exists as "Name_ADDRESS" (or the other way round) is an
+                            alias, like --op-alias Name=Name_ADDRESS: an inline method and
+                            its named out-of-line copy (an OP can also be a method name)
       --inline-callees      also permute the inline functions the target calls: their
                             definitions in the source (if marked inline) and in the
                             headers it includes
       --max-callees N       at most N of those (default 8)
+      --extern-globals      also try each global the function reads declared the other way
+                            in its file: a definition as an extern declaration, or an
+                            extern as its definition (taken from another .cpp in the
+                            source's directory). VC6 can code a global defined in the same
+                            file differently (see README)
+      --calling-conventions also try the function and the functions it calls declared
+                            with another calling convention (none, __cdecl, __stdcall,
+                            __fastcall), at every declaration in the source and its headers
+                            at once. It changes calls and VC6's scheduling after them, even
+                            without parameters (see README)
+      --global-macros D=E   the macros of those declarations (default
+                            DEFINE_GLOBAL=EXTERN_GLOBAL, gta2_re's Function.hpp)
   -I, --include-dir DIR     where to look for #include "..." headers besides the
                             including file's directory (default: the source's)
       --mirror-root DIR     candidates are compiled in a mirror of this directory
@@ -91,6 +112,8 @@ Other functions (for helpers VC6 inlines into the target):
 
 Output:
   -o, --output-dir DIR      where improvements go (default: permuter_out)
+      --resume              carry on from the checkpoint a previous run with the same
+                            function, passes and search options left in the output dir
       --keep-ties           also write candidates that tie the best score
       --only-if-below N     only write candidates scoring below N
       --base-only           compile and score the unmodified function, then exit
@@ -131,7 +154,12 @@ struct Options {
     int jobs = 1;
     int timeout = 120;
     std::string outputDir = "permuter_out";
-    std::vector<std::string> also, includeDirs, checkParse;
+    bool resume = false;
+    std::vector<std::string> also, includeDirs, checkParse, opAliases;
+    bool externGlobals = false;
+    bool callingConventions = false;
+    bool autoMethodAliases = false;
+    std::string globalMacros = "DEFINE_GLOBAL=EXTERN_GLOBAL";
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
     int maxCallees = 8;
@@ -210,8 +238,14 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "jobs" || key == "j") return num(o.jobs);
     if (key == "timeout") return num(o.timeout);
     if (key == "output-dir" || key == "o") return need() && (o.outputDir = val, true);
+    if (key == "resume") return o.resume = true;
     if (key == "also") return need() && (o.also.push_back(val), true);
+    if (key == "op-alias") return need() && (o.opAliases.push_back(val), true);
     if (key == "inline-callees") return o.inlineCallees = true;
+    if (key == "extern-globals") return o.externGlobals = true;
+    if (key == "calling-conventions") return o.callingConventions = true;
+    if (key == "auto-method-aliases") return o.autoMethodAliases = true;
+    if (key == "global-macros") return need() && (o.globalMacros = val, true);
     if (key == "max-callees") return num(o.maxCallees);
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
     if (key == "mirror-root") return need() && (o.mirrorRoot = val, true);
@@ -233,7 +267,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals", "calling-conventions", "auto-method-aliases",
     };
     return flags.count(k) > 0;
 }
@@ -380,10 +414,25 @@ struct Stopwatch {
     }
 };
 
+// FNV-1a: the same on every platform and build, so checkpoints can store hashes.
+uint64_t fnv64(const std::string& s, uint64_t h = 14695981039346656037ull) {
+    for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
+    return h;
+}
+
 size_t hashCand(const Cand& c) {
     std::string all;
     for (auto& t : c) all += t + '\x01';
-    return std::hash<std::string>()(all);
+    return (size_t)fnv64(all);
+}
+
+// The random generator of candidate number idx: every candidate has its own,
+// so a run can be resumed from any index.
+Rng candRng(uint64_t seed, long idx) {
+    uint64_t z = seed + 0x9E3779B97F4A7C15ull * (uint64_t)(idx + 1);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return Rng(z ^ (z >> 31));
 }
 
 struct Workspace {
@@ -470,10 +519,8 @@ struct Evaluator {
             CmdResult r = runCommand(expandTemplate(o.scoreCmd, {{"obj", obj}, {"src", srcPath(w)}}), o.timeout);
             bool ok;
             double v = lastNumber(r.output, ok);
-            if (r.status != 0 || !ok) {
-                log = r.output;
-                return -1;
-            }
+            log = r.output; // on success it goes to score_output.txt (e.g. an asm diff)
+            if (r.status != 0 || !ok) return -1;
             return (long)(v + 0.5);
         }
         std::vector<Insn> mine;
@@ -495,7 +542,132 @@ struct State {
     long compiles = 0, failures = 0, improvements = 0;
     std::unordered_set<size_t> seen;
     int outputs = 0, ties = 0;
+    // checkpointing: candidates are numbered in the order they are generated
+    std::string key;           // what a checkpoint must match to be resumed
+    uint64_t seed = 0;         // random mode
+    long next = 0;             // index of the next candidate to generate
+    long resumeFrom = 0;       // exhaustive: candidates before this were done by an earlier run
+    long compilesAtStart = 0;  // -n counts this run's compiles
+    std::set<long> inFlight;   // generated but not yet scored
 };
+
+// --- checkpoints ------------------------------------------------------------------
+//
+// <output-dir>/checkpoint.txt holds the search position, checkpoint_best.txt the
+// best candidate and checkpoint_seen.txt the hashes of the candidates already tried
+// (random mode). Candidate n of a run is a function of (key, seed, n) and, in random
+// mode with --keep-prob, of the best candidate when it was generated: -j 1 always
+// gives the same sequence, and a resumed run carries on from the first candidate
+// that wasn't scored.
+
+const char* const kRegionSep = "\n@@@cpp_permuter region@@@\n";
+
+std::string checkpointKey(const Options& o, const std::vector<std::string>& base) {
+    std::string k = o.function + '\x01' + o.mode + '\x01';
+    for (auto& p : o.passes) k += p + ',';
+    for (auto& w : o.weights) k += w + ',';
+    for (auto& a : o.opAliases) k += a + ',';
+    k += '\x01' + std::to_string(o.depth) + '\x01' + std::to_string(o.maxMutations) + '\x01' +
+         std::to_string(o.keepProb) + '\x01';
+    for (auto& r : base) k += r + '\x01';
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)fnv64(k));
+    return buf;
+}
+
+// Call with st.mu held.
+void saveCheckpoint(const Options& o, const State& st) {
+    std::error_code ec;
+    fs::create_directories(o.outputDir, ec);
+    long next = st.inFlight.empty() ? st.next : *st.inFlight.begin();
+    std::ostringstream c;
+    c << "cpp_permuter checkpoint 1\n"
+      << "key " << st.key << "\n"
+      << "mode " << o.mode << "\n"
+      << "seed " << st.seed << "\n"
+      << "next " << next << "\n"
+      << "compiles " << st.compiles << "\n"
+      << "failures " << st.failures << "\n"
+      << "improvements " << st.improvements << "\n"
+      << "outputs " << st.outputs << "\n"
+      << "best_score " << st.bestScore << "\n";
+    std::string best;
+    for (size_t i = 0; i < st.best.size(); ++i) best += (i ? kRegionSep : "") + st.best[i];
+    std::string seen;
+    if (o.mode == "random") {
+        char buf[20];
+        for (size_t h : st.seen) {
+            std::snprintf(buf, sizeof buf, "%016llx\n", (unsigned long long)h);
+            seen += buf;
+        }
+    }
+    auto put = [&](const std::string& name, const std::string& text) {
+        fs::path p = fs::path(o.outputDir) / name, tmp = p;
+        tmp += ".tmp";
+        if (writeFile(tmp.string(), text)) fs::rename(tmp, p, ec);
+    };
+    put("checkpoint_best.txt", best);
+    put("checkpoint_seen.txt", seen);
+    put("checkpoint.txt", c.str()); // last: it is what --resume looks for
+}
+
+bool loadCheckpoint(const Options& o, State& st, std::string& err) {
+    std::string text;
+    fs::path dir(o.outputDir);
+    if (!readFile((dir / "checkpoint.txt").string(), text)) {
+        err = "no checkpoint in " + o.outputDir;
+        return false;
+    }
+    std::map<std::string, std::string> kv;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t sp = line.find(' ');
+        if (sp != std::string::npos) kv[line.substr(0, sp)] = line.substr(sp + 1);
+    }
+    if (kv["key"] != st.key) {
+        err = "the checkpoint in " + o.outputDir +
+              " is for a different function, source or search options (key " + kv["key"] + ", now " + st.key + ")";
+        return false;
+    }
+    try {
+        st.seed = std::stoull(kv["seed"]);
+        st.next = st.resumeFrom = std::stol(kv["next"]);
+        st.compiles = st.compilesAtStart = std::stol(kv["compiles"]);
+        st.failures = std::stol(kv["failures"]);
+        st.improvements = std::stol(kv["improvements"]);
+        st.outputs = std::stoi(kv["outputs"]);
+        long bestScore = std::stol(kv["best_score"]);
+        std::string best;
+        if (bestScore < st.bestScore && readFile((dir / "checkpoint_best.txt").string(), best)) {
+            Cand c;
+            size_t at = 0, sep;
+            std::string s = kRegionSep;
+            while ((sep = best.find(s, at)) != std::string::npos) {
+                c.push_back(best.substr(at, sep - at));
+                at = sep + s.size();
+            }
+            c.push_back(best.substr(at));
+            if (c.size() == st.base.size()) {
+                st.best = c;
+                st.bestScore = bestScore;
+            }
+        }
+    } catch (...) {
+        err = "can't read " + (dir / "checkpoint.txt").string();
+        return false;
+    }
+    if (o.mode == "random") {
+        std::string seen;
+        readFile((dir / "checkpoint_seen.txt").string(), seen);
+        std::istringstream sin(seen);
+        while (std::getline(sin, line))
+            if (!line.empty()) st.seen.insert((size_t)std::stoull(line, nullptr, 16));
+    } else {
+        st.next = 0; // exhaustive: replayed from the start, see runExhaustive
+    }
+    return true;
+}
 
 // Diff of every region that changed, with a header per region when there are several.
 std::string candDiff(const Workspace& ws, const Cand& c) {
@@ -509,7 +681,7 @@ std::string candDiff(const Workspace& ws, const Cand& c) {
 }
 
 void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
-                 const std::vector<Insn>& insns) {
+                 const std::vector<Insn>& insns, const std::string& scoreOutput) {
     const Workspace& ws = ev.ws;
     std::string dir = (fs::path(o.outputDir) / ("output-" + std::to_string(score) + "-" +
                                                 std::to_string(++st.outputs)))
@@ -531,6 +703,7 @@ void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c
     writeFile(dir + "/diff.txt", diff);
     if (!insns.empty()) writeFile(dir + "/asm_diff.txt", diffInsns(ev.sc, ev.target, insns));
     writeFile(dir + "/score.txt", std::to_string(score) + "\n");
+    if (!o.scoreCmd.empty()) writeFile(dir + "/score_output.txt", scoreOutput);
     std::cout << "\n[" << score << "] " << (score < st.bestScore ? "new best (was " + std::to_string(st.bestScore) + ")" : std::string("tie"))
               << ", written to " << dir
               << "\n"
@@ -539,8 +712,9 @@ void writeOutput(const Options& o, const Evaluator& ev, State& st, const Cand& c
 
 // Records a scored candidate. Returns true if it was a match and we should stop.
 bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, long score,
-            const std::vector<Insn>& insns, const std::string& log) {
+            const std::vector<Insn>& insns, const std::string& log, long idx = -1) {
     std::lock_guard<std::mutex> lk(st.mu);
+    st.inFlight.erase(idx);
     st.compiles++;
     if (score < 0) {
         st.failures++;
@@ -549,13 +723,13 @@ bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, lon
     }
     bool wanted = o.onlyBelow < 0 || score < o.onlyBelow;
     if (score < st.bestScore) {
-        if (wanted) writeOutput(o, ev, st, c, score, insns);
+        if (wanted) writeOutput(o, ev, st, c, score, insns, log);
         st.bestScore = score;
         st.best = c;
         st.improvements++;
     } else if (o.keepTies && score == st.bestScore && score < st.baseScore && wanted && st.ties < 200) {
         st.ties++;
-        writeOutput(o, ev, st, c, score, insns);
+        writeOutput(o, ev, st, c, score, insns, log);
     }
     return score == 0 && !o.keepGoing;
 }
@@ -569,17 +743,60 @@ void printStatus(State& st) {
 
 // One random candidate derived from start; empty if nothing applied. With
 // several regions, half the mutations go to the target function.
-Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, const Cand& start,
-                     Rng& rng) {
+// A global's declaration region switched to its other form, or back.
+std::string toggledGlobal(const Workspace& ws, const Cand& c, size_t r) {
+    return c[r] == ws.base[r] ? ws.regions[r].alt : ws.base[r];
+}
+
+std::string noSpace(const std::string& s) {
+    std::string r;
+    for (char ch : s)
+        if (!std::isspace((unsigned char)ch)) r += ch;
+    return r;
+}
+
+// The calling convention a convention site holds in c (an index into its alts), or -1.
+int conventionChoice(const Workspace& ws, const Cand& c, size_t r) {
+    auto& alts = ws.regions[r].alts;
+    for (size_t i = 0; i < alts.size(); ++i)
+        if (noSpace(alts[i]) == noSpace(c[r])) return (int)i;
+    return -1;
+}
+
+// Sets every site of r's function to the same calling convention.
+void setConvention(const Workspace& ws, Cand& c, size_t r, int choice) {
+    for (size_t j = 0; j < c.size(); ++j)
+        if (ws.regions[j].link == ws.regions[r].link && !ws.regions[j].alts.empty())
+            c[j] = ws.regions[j].alts[choice];
+}
+
+Cand randomCandidate(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups,
+                     const Cand& start, Rng& rng) {
     int total = 0;
     for (auto& g : groups) total += g.weight();
     if (total <= 0) return {};
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
     Cand c = start;
+    std::vector<size_t> funcs, globals; // regions by kind; funcs[0] is the target
+    for (size_t i = 0; i < c.size(); ++i) (ws.regions[i].isToggle() ? globals : funcs).push_back(i);
     for (int m = 0; m < k; ++m) {
+        // a global's declaration: one mutation in eight
+        if (!globals.empty() && std::uniform_int_distribution<int>(0, 7)(rng) == 0) {
+            size_t g = globals[std::uniform_int_distribution<size_t>(0, globals.size() - 1)(rng)];
+            if (!ws.regions[g].alts.empty()) {
+                int n = (int)ws.regions[g].alts.size();
+                int cur = conventionChoice(ws, c, g);
+                int pick = std::uniform_int_distribution<int>(0, n - 2)(rng);
+                if (cur >= 0 && pick >= cur) pick++;
+                setConvention(ws, c, g, pick);
+                continue;
+            }
+            c[g] = toggledGlobal(ws, c, g);
+            continue;
+        }
         size_t r = 0;
-        if (c.size() > 1 && std::uniform_int_distribution<int>(0, 1)(rng) == 1)
-            r = std::uniform_int_distribution<size_t>(1, c.size() - 1)(rng);
+        if (funcs.size() > 1 && std::uniform_int_distribution<int>(0, 1)(rng) == 1)
+            r = funcs[std::uniform_int_distribution<size_t>(1, funcs.size() - 1)(rng)];
         for (int attempt = 0; attempt < 10; ++attempt) {
             int x = std::uniform_int_distribution<int>(0, total - 1)(rng);
             const PassGroup* g = &groups.back();
@@ -600,7 +817,7 @@ Cand randomCandidate(const Options& o, const std::vector<PassGroup>& groups, con
     return c == start ? Cand{} : c;
 }
 
-void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+void enumerateCand(const Workspace& ws, const std::vector<PassGroup>& groups, const Cand& c,
                    const std::function<bool(const Cand&, const std::string&)>& emit);
 
 bool hasMacros(const Workspace& ws) { return ws.macro && ws.macro->hasMacros(); }
@@ -619,7 +836,7 @@ Cand nextRandom(const Options& o, const Workspace& ws, const std::vector<PassGro
         // a third of the time, the expansion on its own
         if (!ws.passesOn || (start != ws.base && coin(rng) < 1.0 / 3)) return start == ws.base ? Cand{} : start;
     }
-    Cand c = randomCandidate(o, groups, start, rng);
+    Cand c = randomCandidate(o, ws, groups, start, rng);
     if (c.empty() && start != ws.base) return start;
     return c;
 }
@@ -647,7 +864,7 @@ void exhaustiveCands(const Options& o, const Workspace& ws, const std::vector<Pa
         std::vector<Cand> next;
         for (auto& c : level) {
             if (stop) break;
-            enumerateCand(groups, c, [&](const Cand& n, const std::string& g) {
+            enumerateCand(ws, groups, c, [&](const Cand& n, const std::string& g) {
                 int r = emit(n, g);
                 if (r == 0) stop = true;
                 if (r == 1 && d < o.depth) next.push_back(n);
@@ -659,20 +876,22 @@ void exhaustiveCands(const Options& o, const Workspace& ws, const std::vector<Pa
 }
 
 int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
-    unsigned long long seed = o.seedSet ? o.seed : (unsigned long long)std::random_device{}();
     std::vector<std::thread> workers;
     std::atomic<int> idle{0};
     for (int w = 0; w < o.jobs; ++w) {
         workers.emplace_back([&, w]() {
-            Rng rng(seed + (unsigned long long)w * 7919);
             int misses = 0;
             while (!gStop) {
                 Cand best;
+                long idx;
                 {
                     std::lock_guard<std::mutex> lk(st.mu);
-                    if (o.iterations && st.compiles >= o.iterations) break;
+                    if (o.iterations && st.compiles - st.compilesAtStart >= o.iterations) break;
                     best = st.best;
+                    idx = st.next++;
+                    st.inFlight.insert(idx);
                 }
+                Rng rng = candRng(st.seed, idx);
                 Stopwatch gen;
                 Cand cand = nextRandom(o, ev.ws, groups, best, rng);
                 gTimes.permute += gen.us();
@@ -683,6 +902,10 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
                     fresh = st.seen.insert(hashCand(cand)).second;
                 }
                 if (!fresh) {
+                    {
+                        std::lock_guard<std::mutex> lk(st.mu);
+                        st.inFlight.erase(idx);
+                    }
                     if (++misses > 2000) break; // nothing new left to try
                     continue;
                 }
@@ -690,7 +913,8 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
                 std::string log;
                 std::vector<Insn> insns;
                 long s = ev.eval(w, cand, log, &insns);
-                if (report(o, ev, st, cand, s, insns, log)) gStop = true;
+                if (gStop && s < 0) break; // interrupted: leave it for a resumed run
+                if (report(o, ev, st, cand, s, insns, log, idx)) gStop = true;
             }
             idle++;
         });
@@ -699,16 +923,37 @@ int runRandom(const Options& o, const Evaluator& ev, State& st, const std::vecto
         for (int i = 0; i < 20 && idle < o.jobs; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         printStatus(st);
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
     }
     for (auto& t : workers) t.join();
     return 0;
 }
 
-// Every candidate one pass or combo away from c, in any region.
-void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
+// Every candidate one pass or combo away from c, in any region (for a global's
+// declaration: the other form).
+void enumerateCand(const Workspace& ws, const std::vector<PassGroup>& groups, const Cand& c,
                    const std::function<bool(const Cand&, const std::string&)>& emit) {
     bool stop = false;
-    for (size_t r = 0; r < c.size() && !stop; ++r)
+    for (size_t r = 0; r < c.size() && !stop; ++r) {
+        if (!ws.regions[r].alts.empty()) {
+            bool seen = false; // one site per function
+            for (size_t j = 0; j < r; ++j) seen |= ws.regions[j].link == ws.regions[r].link;
+            int cur = conventionChoice(ws, c, r);
+            for (int k = 0; k < (int)ws.regions[r].alts.size() && !seen && !stop; ++k) {
+                if (k == cur) continue;
+                Cand n = c;
+                setConvention(ws, n, r, k);
+                if (!emit(n, "calling_convention")) stop = true;
+            }
+            continue;
+        }
+        if (!ws.regions[r].alt.empty()) {
+            Cand n = c;
+            n[r] = toggledGlobal(ws, c, r);
+            if (!emit(n, "extern_global")) stop = true;
+            continue;
+        }
         for (auto& g : groups) {
             if (stop) break;
             enumerateGroup(g, c[r], [&](const std::string& s) {
@@ -718,30 +963,34 @@ void enumerateCand(const std::vector<PassGroup>& groups, const Cand& c,
                 return !stop;
             });
         }
+    }
 }
 
 int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::vector<PassGroup>& groups) {
     std::mutex qmu;
     std::condition_variable qcv;
-    std::deque<Cand> queue;
+    std::deque<std::pair<long, Cand>> queue; // candidate index, candidate
     bool done = false;
     long produced = 0;
 
     auto worker = [&](int w) {
         while (true) {
             Cand cand;
+            long idx;
             {
                 std::unique_lock<std::mutex> lk(qmu);
                 qcv.wait(lk, [&] { return !queue.empty() || done || gStop; });
                 if (gStop || (queue.empty() && done)) return;
-                cand = std::move(queue.front());
+                idx = queue.front().first;
+                cand = std::move(queue.front().second);
                 queue.pop_front();
             }
             qcv.notify_all();
             std::string log;
             std::vector<Insn> insns;
             long s = ev.eval(w, cand, log, &insns);
-            if (report(o, ev, st, cand, s, insns, log)) {
+            if (gStop && s < 0) return; // interrupted: leave it for a resumed run
+            if (report(o, ev, st, cand, s, insns, log, idx)) {
                 gStop = true;
                 qcv.notify_all();
             }
@@ -756,15 +1005,24 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
         exhaustiveCands(o, ev.ws, groups, [&](const Cand& n, const std::string&) {
             gTimes.generated++;
             if (gStop || produced >= o.maxCandidates) return 0;
+            long idx;
             {
+                // the order doesn't depend on the scores, so a resumed run replays the
+                // earlier candidates (without compiling them) to get the same 'seen'
                 std::lock_guard<std::mutex> lk(st.mu);
+                idx = st.next++;
                 if (!st.seen.insert(hashCand(n)).second) return 2;
+                if (idx < st.resumeFrom) {
+                    produced++;
+                    return 1;
+                }
+                st.inFlight.insert(idx);
             }
             produced++;
             Stopwatch wait;
             std::unique_lock<std::mutex> lk(qmu);
             qcv.wait(lk, [&] { return queue.size() < 256 || gStop; });
-            queue.push_back(n);
+            queue.push_back({idx, n});
             qcv.notify_all();
             waited += wait.us();
             return 1;
@@ -786,6 +1044,8 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
             if ((done && queue.empty()) || gStop) break;
         }
         printStatus(st);
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
     }
     producer.join();
     {
@@ -927,6 +1187,7 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << err << "\n\n" << kUsage;
         return 2;
     }
+    if (o.maxCandidates <= 0) o.maxCandidates = LONG_MAX;  // --max-candidates 0: no limit
     if (o.listPasses) {
         for (auto& p : allPasses()) std::cout << "  " << p.name << "\n      " << p.description << "\n";
         return 0;
@@ -1021,7 +1282,7 @@ int main(int argc, char** argv) {
     if (dirs.empty()) dirs.push_back(fs::path(srcPath).parent_path().string());
     ws.root = o.mirrorRoot.empty() ? fs::path(srcPath).parent_path().string()
                                    : fs::absolute(o.mirrorRoot).lexically_normal().string();
-    ws.regions.push_back({srcPath, start, end, o.function});
+    ws.regions.push_back({srcPath, start, end, o.function, ""});
     auto addRegion = [&](const Region& r) {
         for (auto& x : ws.regions)
             if (x.file == r.file && x.start < r.end && r.start < x.end) return; // overlaps
@@ -1037,12 +1298,40 @@ int main(int argc, char** argv) {
     }
     if (o.inlineCallees)
         for (auto& r : inlineCallees(srcPath, start, end, *func, dirs, (size_t)o.maxCallees)) addRegion(r);
+    if (o.externGlobals) {
+        size_t eq = o.globalMacros.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == o.globalMacros.size()) {
+            std::cerr << "error: --global-macros " << o.globalMacros << ": expected DEFINE=EXTERN\n";
+            return 2;
+        }
+        std::set<std::string> names;
+        for (auto& t : func->toks)
+            if (t.kind == TokKind::Ident) names.insert(t.text);
+        std::string text;
+        readFile(srcPath, text);
+        for (auto& r : globalRegions(srcPath, text, names, o.globalMacros.substr(0, eq), o.globalMacros.substr(eq + 1)))
+            addRegion(r);
+    }
+    if (o.callingConventions) {
+        std::set<std::string> names = calledNames(*func);
+        std::string self = o.function.substr(o.function.rfind(':') == std::string::npos ? 0 : o.function.rfind(':') + 1);
+        names.insert(self);
+        std::vector<std::string> files = {srcPath};
+        for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+        int link = 0;
+        for (auto& r : ws.regions) link = std::max(link, r.link + 1);
+        for (auto& r : conventionRegions(files, names, link)) addRegion(r);
+    }
     for (auto& r : ws.regions) {
         if (!ws.files.count(r.file) && !readFile(r.file, ws.files[r.file])) {
             std::cerr << "error: can't read " << r.file << "\n";
             return 1;
         }
         std::string text = ws.files[r.file].substr(r.start, r.end - r.start);
+        if (r.isToggle()) { // a global's declaration or a calling convention, not a function
+            ws.base.push_back(text);
+            continue;
+        }
         if (ws.base.empty()) {
             ws.macro = std::make_shared<MacroExpander>(text);
             if (!ws.macro->error().empty()) {
@@ -1068,14 +1357,66 @@ int main(int argc, char** argv) {
     // inline getters for use_getter: in the source and the headers it includes
     {
         std::vector<Getter> gs;
+        std::map<std::string, std::string> fts;
         std::vector<std::string> files = {srcPath};
         for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
         for (auto& file : files) {
             std::string text;
-            if (readFile(file, text))
-                for (auto& g : findGetters(text)) gs.push_back(g);
+            if (!readFile(file, text)) continue;
+            for (auto& g : findGetters(text)) gs.push_back(g);
+            for (auto& [n, t] : findFieldTypes(text)) {
+                auto it = fts.find(n);
+                if (it == fts.end()) fts[n] = t;
+                else if (it->second != t) it->second.clear();
+            }
         }
         setGetters(gs);
+        setFieldTypes(fts);
+    }
+    // operators with named out-of-line versions, for named_op
+    {
+        std::vector<OpAlias> as;
+        for (auto& spec : o.opAliases) {
+            size_t eq = spec.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 == spec.size()) {
+                std::cerr << "error: --op-alias " << spec << ": expected OP=NAME\n";
+                return 1;
+            }
+            as.push_back({spec.substr(0, eq), spec.substr(eq + 1)});
+        }
+        if (o.autoMethodAliases) {
+            // "Name" and "Name_4086A0" both declared in the source or its headers, and one of them
+            // called by the function: an inline method and its named out-of-line copy
+            std::set<std::string> declared;
+            std::vector<std::string> files = {srcPath};
+            for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+            for (auto& file : files) {
+                std::string text;
+                if (!readFile(file, text)) continue;
+                auto toks = lex(text);
+                for (size_t i = 0; i + 1 < toks.size(); ++i)
+                    if (toks[i].kind == TokKind::Ident && toks[i + 1].text == "(") declared.insert(toks[i].text);
+            }
+            std::set<std::string> called;
+            for (auto& r : ws.regions)
+                if (!r.isToggle()) {
+                    std::string ferr;
+                    auto fn = parseFunc(ws.base[&r - &ws.regions[0]], ferr);
+                    if (fn)
+                        for (auto& n : calledNames(*fn)) called.insert(n);
+                }
+            for (auto& n : declared) {
+                if (n.size() < 8 || n[n.size() - 7] != '_') continue;
+                bool hex = true;
+                for (size_t i = n.size() - 6; i < n.size(); ++i) hex &= std::isxdigit((unsigned char)n[i]) != 0;
+                std::string base = n.substr(0, n.size() - 7);
+                if (!hex || base.empty() || !declared.count(base)) continue;
+                if (!called.count(n) && !called.count(base)) continue;
+                as.push_back({base, n});
+                if (o.verbose) std::cout << "method alias: " << base << " = " << n << "\n";
+            }
+        }
+        setOpAliases(as);
     }
     if (o.listRegions || ws.regions.size() > 1) {
         std::cout << "permuting:\n";
@@ -1164,8 +1505,32 @@ int main(int argc, char** argv) {
         cleanup();
         return 0;
     }
+    st.key = checkpointKey(o, ws.base);
+    st.seed = o.seedSet ? o.seed : (uint64_t)std::random_device{}();
+    if (o.resume) {
+        if (!loadCheckpoint(o, st, err)) {
+            std::cerr << "error: --resume: " << err << "\n";
+            cleanup();
+            return 1;
+        }
+        if (o.seedSet && o.seed != st.seed)
+            std::cerr << "warning: --seed ignored, resuming with the checkpoint's seed " << st.seed << "\n";
+        std::cout << "resuming at candidate " << st.resumeFrom << " (seed " << st.seed << ", " << st.compiles
+                  << " compiles so far, best " << st.bestScore << ")\n";
+        if (st.bestScore == 0 && !o.keepGoing) {
+            std::cout << "the checkpoint already has a match\n";
+            cleanup();
+            return 0;
+        }
+    } else {
+        std::cout << "seed: " << st.seed << " (resume with --resume, same options)\n";
+    }
     if (o.mode == "random") runRandom(o, ev, st, groups);
     else runExhaustive(o, ev, st, groups);
+    {
+        std::lock_guard<std::mutex> lk(st.mu);
+        saveCheckpoint(o, st);
+    }
     cleanup();
 
     std::cout << "\n";

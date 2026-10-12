@@ -391,6 +391,32 @@ static void testBoolReturn() {
     CHECK(run("int f(int a)\n{\n    return a + 1;\n}\n", "bool_return").empty());
 }
 
+static void testExtraPasses() {
+    auto b = run("void f(u8 k)\n{\n    g = k < 3;\n}\n", "bool_assign");
+    CHECK(any(b, {"if (k < 3)", "g = 1;", "else", "g = 0;"}));
+    CHECK(any(b, {"g = 0;\n    if (k < 3)"}));
+    auto r = run("void f(u8 k)\n{\n    if (k & 0x80)\n        g = 1;\n    else\n        g = 0;\n}\n", "bool_assign");
+    CHECK(any(r, {"g = (k & 0x80) != 0;"}));
+    CHECK(run("void f(u8 k)\n{\n    g = k + 3;\n}\n", "bool_assign").empty());
+
+    const char* two = "void f(P* p)\n{\n    C** a = p->h;\n    a[0] = 0;\n    C** b = p->h + 1;\n    b[0] = p->c;\n}\n";
+    CHECK(any(run(two, "reuse_local"), {"    a = p->h + 1;\n    a[0] = p->c;"}));
+    // a is read again after b's declaration: no reuse
+    CHECK(run("void f(P* p)\n{\n    C* a = p->h;\n    C* b = p->g;\n    a->x = b->x;\n}\n", "reuse_local").empty());
+    // a is read at the top of a loop that assigns b: no reuse
+    CHECK(run("void f(P* p)\n{\n    C* a = p->h;\n    while (p)\n    {\n        g(a);\n        C* b = p->g;\n"
+              "        g(b);\n    }\n}\n", "reuse_local").empty());
+
+    const char* one = "void f(P* p)\n{\n    C** a = p->h;\n    a[0] = 0;\n    a = p->h + 1;\n    a[0] = p->c;\n}\n";
+    CHECK(any(run(one, "split_local"), {"    C** a_2 = p->h + 1;\n    a_2[0] = p->c;"}));
+
+    auto u = run("void f(P* p)\n{\n    C* c = p->c;\n    if (c)\n        c->g();\n}\n", "inline_use");
+    CHECK(any(u, {"C* c = p->c;", "if (p->c)", "c->g();"}));
+    CHECK(any(u, {"if (c)", "p->c->g();"}));
+    // a store between the local and the use: not read again there
+    CHECK(run("void f(P* p)\n{\n    C* c = p->c;\n    g(c);\n    p->c = 0;\n    g(c);\n}\n", "inline_use").size() == 1);
+}
+
 static void testTernaryArg() {
     auto v = run("void f(P* p, int x)\n{\n    p->g(x == 0 ? 1 : 0);\n}\n", "ternary_arg");
     CHECK(any(v, {"if (x == 0)\n    {\n        p->g(1);\n    }\n    else\n    {\n        p->g(0);\n    }"}));
@@ -655,6 +681,33 @@ static void testTempForExpr() {
     CHECK(any(v, {"s32 tmp = *q;\n    g((u8)p->a, n, tmp);"}));
 }
 
+static void testNamedOp() {
+    setOpAliases({{"*", "Multiply_408680"}, {"neg", "Negate_4086A0"}});
+    auto v = run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return -a * b;\n}\n", "named_op");
+    CHECK(any(v, {"return (-a).Multiply_408680(b);"}));
+    CHECK(any(v, {"return a.Negate_4086A0() * b;"}));
+    auto back = run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return a.Negate_4086A0().Multiply_408680(b + a);\n}\n",
+                    "named_op");
+    CHECK(any(back, {"return (a.Negate_4086A0() * (b + a));"}));
+    CHECK(any(back, {"return (-a).Multiply_408680(b + a);"}));
+    // p->Negate() isn't rewritten: there is no value to apply the operator to
+    CHECK(run("Fix16 f(Fix16* p)\n{\n    return p->Negate_4086A0();\n}\n", "named_op").empty());
+    setOpAliases({});
+    CHECK(run("Fix16 f(Fix16 a, Fix16 b)\n{\n    return a * b;\n}\n", "named_op").empty());
+}
+
+static void testCastOperand() {
+    auto v = run("u32 f(s32 a, u8 b)\n{\n    return a / b;\n}\n", "cast_operand");
+    CHECK(any(v, {"return (u32)a / b;"}));
+    CHECK(any(v, {"return a / (s32)b;"}));
+    CHECK(v.size() == 12);
+    auto c = run("u32 f(s32 a)\n{\n    return (s32)(a + 1) >> 2;\n}\n", "cast_operand");
+    CHECK(any(c, {"return (a + 1) >> 2;"}));
+    CHECK(any(c, {"return (u32)(a + 1) >> 2;"}));
+    // constants are left alone
+    CHECK(run("u32 f()\n{\n    return 4 >> 1;\n}\n", "cast_operand").empty());
+}
+
 static void testRemoveStmt() {
     auto v = run("void f(int n)\n{\n    a();\n    WIP_IMPLEMENTED;\n    b();\n}\n", "remove_stmt");
     CHECK(v.size() == 3 && any(v, {"    a();\n    b();"}));
@@ -704,7 +757,30 @@ static void testPassDocs() {
     for (auto& p : allPasses()) CHECK(contains(gen, "## `" + p.name + "`"));
 }
 
+static void testConventionRegions() {
+    auto dir = std::filesystem::temp_directory_path() / "perm_cc_test";
+    std::filesystem::create_directories(dir);
+    std::string h = (dir / "a.hpp").string(), c = (dir / "a.cpp").string();
+    std::ofstream(h) << "struct K\n{\n    EXPORT static s32 Get();\n};\nchar __stdcall Set(int a);\n";
+    std::ofstream(c) << "s32 K::Get()\n{\n    return Set(1);\n}\n";
+    auto rs = perm::conventionRegions({c, h}, {"Get", "Set"}, 0);
+    CHECK(rs.size() == 3);
+    int get = -1, set = -1;
+    for (auto& r : rs) {
+        CHECK(r.alts.size() == 4);
+        if (r.name == "convention Get") {
+            CHECK(get < 0 || get == r.link);
+            get = r.link;
+        } else {
+            set = r.link;
+        }
+    }
+    CHECK(get >= 0 && set >= 0 && get != set);
+    std::filesystem::remove_all(dir);
+}
+
 int main() {
+    testExtraPasses();
     testPassDocs();
     testInequalities();
     testChainAssign();
@@ -715,6 +791,8 @@ int main() {
     testSplitCaseLabels();
     testUseGetter();
     testTempForExpr();
+    testNamedOp();
+    testCastOperand();
     testRemoveStmt();
     testMacros();
     testListDefinitions();
@@ -736,6 +814,7 @@ int main() {
     testEffects();
     testReorderSaves();
     testInlineLocal();
+    testConventionRegions();
     testSinkHoistMerge();
     testExprPasses();
     testExprParser();

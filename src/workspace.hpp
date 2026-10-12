@@ -18,6 +18,15 @@ struct Region {
     size_t start = 0;  // byte range of the definition in the original file
     size_t end = 0;
     std::string name;  // as given or found, e.g. "Ped::GetX"
+    // A global's declaration rather than a function: the other form of the line
+    // (the extern declaration of a definition, or the definition of an extern).
+    std::string alt;
+    // A calling convention site (--calling-conventions): the text between a declaration's return
+    // type and its name. alts are the four choices (none, __cdecl, __stdcall, __fastcall); regions
+    // with the same link (the declarations of one function) always hold the same choice.
+    std::vector<std::string> alts;
+    int link = -1;
+    bool isToggle() const { return !alt.empty() || !alts.empty(); }
 };
 
 // Names of the functions called in f's body (the last component: "GetX" for
@@ -36,6 +45,22 @@ std::vector<Region> inlineCallees(const std::string& srcPath, size_t mainStart, 
                                   size_t maxRegions);
 
 // Replaces each region's range in original with its text. Ranges must not overlap.
+// The definitions and extern declarations, in srcText, of the globals named in
+// `names`, as regions whose alt is the other form, for --extern-globals. Lines
+// look like gta2_re's Function.hpp macros: "<define>[_INIT|_ARRAY...](type, name,
+// ...)" and "<extern>[_ARRAY](type, name[, size])". An extern's definition is
+// looked for in the other .cpp files of srcPath's directory.
+std::vector<Region> globalRegions(const std::string& srcPath, const std::string& srcText,
+                                  const std::set<std::string>& names, const std::string& definePrefix,
+                                  const std::string& externPrefix);
+
+// The calling convention sites of the functions named in `names` (declarations and definitions
+// in `files`), for --calling-conventions. A site is "<return type> [convention] [Class::]name(" at
+// the start of a line; its region is the text between the return type and the name. Sites of one
+// name share a link number, starting at firstLink.
+std::vector<Region> conventionRegions(const std::vector<std::string>& files,
+                                      const std::set<std::string>& names, int firstLink);
+
 std::string spliceRegions(const std::string& original,
                           std::vector<std::pair<const Region*, const std::string*>> parts);
 

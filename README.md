@@ -66,9 +66,10 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `-c/--compile` | compile command. `{src}` is the candidate source, `{obj}` the object it must write, `{dir}` the candidate's directory, `{root}` the mirror's root (see below) |
 | `-t/--target-obj` | object file holding the target code |
 | `--symbol`, `--target-symbol` | symbol names, if the guess from `--function` is wrong (MSVC `?Name@Class@@...`, Itanium, or C) |
-| `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output |
+| `--score-cmd` | score with your own command instead (`{obj}`, `{src}`). It must print the score (0 = match) as the last number in its output. The output is kept as `score_output.txt` with each improvement, so a scorer can print its own asm diff |
+| `--op-alias OP=NAME` | for `named_op`: operator `OP` (`*`, `+`, ..., `neg`) also exists as the method `NAME`. Repeatable |
 | `--ignore-reloc-names` | compare relocated operands without their symbol names, and treat absolute addresses as symbols. Use this when the target came from raw exe asm |
-| `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count |
+| `-m exhaustive` | try every candidate the selected passes and combos produce. `--depth N` chains N of them, `--max-candidates` caps the count (0 = no limit) |
 | `-m random` | (default) apply 1..`--max-mutations` random passes or combos, starting from the base or from the best so far. Runs until a match, `-n` compiles, or Ctrl-C |
 | `-p a,b` | passes to use (default: all). `-p` can be repeated. `a+b` combines passes, see below |
 | `-j N` | parallel compiles |
@@ -87,6 +88,9 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `-I DIR` | where to find headers for `--inline-callees`/`--also`, besides each file's own directory. The compiler's include paths stay in your compile command |
 | `--inline-callees`, `--also [FILE:]NAME` | also permute inline helpers the function calls, see below |
 | `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
+| `--resume` | carry on from the checkpoint in the output directory, see Resuming a run |
+| `--extern-globals` | also try the function's globals declared the other way (definition vs extern), see Globals defined in the same file |
+| `--calling-conventions` | also try the function and its callees with another calling convention, see Calling conventions |
 
 Each improvement goes to `permuter_out/output-<score>-<n>/`:
 
@@ -95,8 +99,38 @@ Each improvement goes to `permuter_out/output-<score>-<n>/`:
 - `<header>.hpp`: each header that changed, when helpers were permuted.
 - `diff.txt`: what changed.
 - `asm_diff.txt`: target and candidate asm aligned side by side.
+- `score_output.txt`: with `--score-cmd`, what the score command printed.
 
 The exit status is 0 if a match was found and 3 if not.
+
+### Resuming a run
+
+Every run keeps a checkpoint in its output directory (`checkpoint.txt`, `checkpoint_best.txt`
+and `checkpoint_seen.txt`), written every couple of seconds and on exit, Ctrl-C included.
+Run again with the same options plus `--resume` to carry on where it stopped:
+
+```sh
+cpp_permuter -s Ped.cpp -f Ped::Foo_123456 -c '...' --score-cmd '...' -j 4 -n 2000
+# stopped, or out of time: the next 2000
+cpp_permuter -s Ped.cpp -f Ped::Foo_123456 -c '...' --score-cmd '...' -j 4 -n 2000 --resume
+```
+
+- Candidates are numbered in the order they are generated. In random mode, candidate `n` is
+  made from its own random generator, seeded from the run's seed and `n` (the seed is printed
+  at the start and kept in the checkpoint, so `--seed` isn't needed to resume). With `-j 1` a
+  seed always gives the same candidates in the same order. With more jobs a candidate can also
+  depend on which improvements had landed when it was made (`--keep-prob`), but a resumed run
+  still starts at the first candidate that wasn't scored and skips every one already tried.
+- Exhaustive mode's order doesn't depend on the scores: a resumed run replays the earlier
+  candidates without compiling them and continues with exactly the ones that weren't scored.
+- The checkpoint records a key made from the function's source, the mode, `-p`, `--weight`,
+  `--op-alias`, `--depth`, `--max-mutations` and `--keep-prob`. `--resume` refuses a
+  checkpoint whose key differs (the source changed, or other passes), since its numbering
+  would mean different candidates. `-j`, `-n`, `--max-candidates` and the output options can
+  change between runs.
+- `-n` counts the compiles of this run; the totals carry over. `--max-candidates` counts
+  from the start of the search. Output directories keep
+  numbering after the earlier run's.
 
 Candidates are compiled in a mirror of the source's directory under
 `permuter_out/.work/w<N>/`, one per worker. The mirror is built from symlinks to every entry,
@@ -131,6 +165,50 @@ Every pass then also works on those helpers. Half of the random mutations go to 
 function, and exhaustive mode tries every pass on every function. Only the target function
 is scored. When a candidate matches, the output has the changed headers next to
 `source.cpp`.
+
+## Globals defined in the same file
+
+VC6 can code a read of a global differently depending on whether the file
+being compiled defines it or only declares it `extern`. In gta2_re, a 2-byte
+global defined in the same file got 32-bit loads, and the original's 16-bit
+loads came back once its definition moved to another file. `--extern-globals`
+lets the permuter try that:
+
+```sh
+cpp_permuter ... --extern-globals
+```
+
+- Each global the function names gets its own region, holding its declaration
+  line in the source file.
+  - A definition (`DEFINE_GLOBAL...(type, name, ...)`) can become
+    `EXTERN_GLOBAL(type, name);` (`EXTERN_GLOBAL_ARRAY(type, name, size);` for
+    arrays).
+  - An extern declaration can become its definition, copied from another .cpp in
+    the source's directory.
+- `--global-macros DEFINE=EXTERN` names other macros with the same argument
+  layout. The default is gta2_re's `DEFINE_GLOBAL=EXTERN_GLOBAL`.
+- Exhaustive mode tries each switch on its own. Random mode switches a global in
+  one mutation in eight.
+- Only the candidate's own object is compiled and scored, so a missing
+  definition doesn't matter. If a switch wins, move the definition by hand: to
+  another .cpp for an extern, or into this file for a definition.
+
+## Calling conventions
+
+A free or static function's calling convention changes more than its calls: in a `__cdecl`
+function VC6's scheduler gives the instructions after a call no call-clobber latency, so even a
+function without parameters schedules differently as `__stdcall` (gta2_re's
+`keybrd_0x204::GetLayout_4D6000` and `SetWindowedMode_5D9510` matched that way). With
+
+```sh
+cpp_permuter ... --calling-conventions
+```
+
+the function and every function it calls get a region per declaration line in the source and the
+headers it includes: the text between the return type and the name. A candidate gives all the
+declarations of one function the same choice of none, `__cdecl`, `__stdcall` or `__fastcall`.
+Exhaustive mode tries each function and convention on its own; random mode switches one in one
+mutation in eight. Declarations split over lines, or after other code on their line, aren't found.
 
 ## PERM macros
 
@@ -223,6 +301,8 @@ on an example function**, generated from the passes themselves
 | `split_case_labels` | `case 1: case 2: S` and `case 1: S case 2: S`, both ways (one jump table entry per case vs a byte index table) |
 | `use_getter` | `p->field_1AC_cam.x` and `p->get_cam_x()`, both ways, using the inline getters found in the source and the headers it includes |
 | `temp_for_expr` | Compute a cast, a local or `*p` into a new local first (`u8 tmp = (u8)p->a; g(tmp);`). Types come from the declarations; also "copy through a local to get a spill" |
+| `named_op` | `a * b` and `a.Multiply_408680(b)`, `-a` and `a.Negate_4086A0()`, both ways, for the operators given with `--op-alias OP=NAME` (`neg` for unary minus). Calling the named out-of-line version decides whether VC6 inlines that use of the operator, which also changes what else it inlines (the inline budget) |
+| `cast_operand` | Cast an operand of `/ % >> < > <= >= + - * == !=` to `u32`, `s32`, `u16`, `s16`, `u8` or `s8`, or drop or change an integer cast there: `div` vs `idiv`, `shr` vs `sar`, `jb` vs `jl`, byte adds. Operands that are non-integer locals or calls are left alone |
 | `remove_stmt` | Remove an expression statement (low weight) |
 
 decomp-permuter passes left out because they rely on IDO behaviour that VC6 `/O2` folds
