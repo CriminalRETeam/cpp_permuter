@@ -549,6 +549,10 @@ struct State {
     long resumeFrom = 0;       // exhaustive: candidates before this were done by an earlier run
     long compilesAtStart = 0;  // -n counts this run's compiles
     std::set<long> inFlight;   // generated but not yet scored
+    // exhaustive: size of the search, counted by a second enumeration while the first one compiles
+    std::atomic<long> total{0};
+    std::atomic<bool> totalDone{false};
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 };
 
 // --- checkpoints ------------------------------------------------------------------
@@ -734,11 +738,31 @@ bool report(const Options& o, const Evaluator& ev, State& st, const Cand& c, lon
     return score == 0 && !o.keepGoing;
 }
 
+std::string duration(double sec) {
+    long s = (long)sec;
+    char buf[32];
+    if (s >= 3600) snprintf(buf, sizeof buf, "%ldh%02ldm", s / 3600, s % 3600 / 60);
+    else snprintf(buf, sizeof buf, "%ldm%02lds", s / 60, s % 60);
+    return buf;
+}
+
 void printStatus(State& st) {
     std::lock_guard<std::mutex> lk(st.mu);
-    std::cout << "\riterations: " << st.compiles << ", failed: " << st.failures
-              << ", base: " << st.baseScore << ", best: " << st.bestScore << "      "
-              << std::flush;
+    std::cout << "\riterations: " << st.compiles;
+    long total = st.total;
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - st.started).count();
+    long mine = st.compiles - st.compilesAtStart; // this run's compiles
+    double perMin = sec > 0 ? mine * 60.0 / sec : 0;
+    if (total > 0)
+        std::cout << " / " << total << (st.totalDone ? "" : "+") << " (" << (st.compiles * 100 / total) << "%)";
+    std::cout << ", failed: " << st.failures << ", base: " << st.baseScore << ", best: " << st.bestScore;
+    if (mine > 0) {
+        std::cout << ", " << (long)perMin << "/min";
+        if (total > 0 && st.totalDone && perMin > 0)
+            std::cout << ", eta " << duration((total - st.compiles) * 60.0 / perMin);
+        std::cout << ", elapsed " << duration(sec);
+    }
+    std::cout << "      " << std::flush;
 }
 
 // One random candidate derived from start; empty if nothing applied. With
@@ -999,6 +1023,21 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
     std::vector<std::thread> workers;
     for (int w = 0; w < o.jobs; ++w) workers.emplace_back(worker, w);
 
+    // count the candidates (same dedup and cap as the producer) so the status line can show
+    // progress and an eta; it only generates, so it is far cheaper than the compiles
+    std::atomic<bool> countStop{false};
+    std::thread counter([&]() {
+        std::unordered_set<size_t> seen = {hashCand(ev.ws.base)};
+        long n = 0;
+        exhaustiveCands(o, ev.ws, groups, [&](const Cand& c, const std::string&) {
+            if (gStop || countStop) return 0;
+            if (!seen.insert(hashCand(c)).second) return 2;
+            st.total = ++n;
+            return n < o.maxCandidates ? 1 : 0;
+        });
+        st.totalDone = true;
+    });
+
     std::thread producer([&]() {
         Stopwatch gen;
         long long waited = 0;
@@ -1048,6 +1087,8 @@ int runExhaustive(const Options& o, const Evaluator& ev, State& st, const std::v
         saveCheckpoint(o, st);
     }
     producer.join();
+    countStop = true; // ends the counter if it is still enumerating
+    counter.join();
     {
         std::lock_guard<std::mutex> lk(qmu);
         done = true;
