@@ -90,6 +90,7 @@ cpp_permuter -s Source/PedGroup.cpp -f PedGroup::PromoteMemberToLeader_4C9680 \
 | `--check-parse FILE...` | parse every function in the files and run every pass on each; see Tests |
 | `--resume` | carry on from the checkpoint in the output directory, see Resuming a run |
 | `--extern-globals` | also try the function's globals declared the other way (definition vs extern), see Globals defined in the same file |
+| `--calling-conventions` | also try the function and its callees with another calling convention, see Calling conventions |
 
 Each improvement goes to `permuter_out/output-<score>-<n>/`:
 
@@ -191,6 +192,23 @@ cpp_permuter ... --extern-globals
 - Only the candidate's own object is compiled and scored, so a missing
   definition doesn't matter. If a switch wins, move the definition by hand: to
   another .cpp for an extern, or into this file for a definition.
+
+## Calling conventions
+
+A free or static function's calling convention changes more than its calls: in a `__cdecl`
+function VC6's scheduler gives the instructions after a call no call-clobber latency, so even a
+function without parameters schedules differently as `__stdcall` (gta2_re's
+`keybrd_0x204::GetLayout_4D6000` and `SetWindowedMode_5D9510` matched that way). With
+
+```sh
+cpp_permuter ... --calling-conventions
+```
+
+the function and every function it calls get a region per declaration line in the source and the
+headers it includes: the text between the return type and the name. A candidate gives all the
+declarations of one function the same choice of none, `__cdecl`, `__stdcall` or `__fastcall`.
+Exhaustive mode tries each function and convention on its own; random mode switches one in one
+mutation in eight. Declarations split over lines, or after other code on their line, aren't found.
 
 ## PERM macros
 

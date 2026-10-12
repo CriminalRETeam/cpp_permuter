@@ -1,3 +1,4 @@
+#include <cctype>
 // More passes, from gta2_re's docs/matching_quirks.md and decomp-permuter's
 // randomizer: comparisons, chained assignments, scopes, local types and
 // arrays, switch case layout, inline getters, temporaries, removals.
@@ -634,8 +635,15 @@ void enumNamedOp(const Func& f, const EmitFn& emit) {
         if (x.k == Expr::Call && x.kids[0]->k == Expr::Member) {
             const Expr& callee = *x.kids[0];
             const Expr& obj = *callee.kids[0];
-            if (f.t(obj.e) != ".") return true;
             const std::string& name = f.t(callee.e - 1);
+            // a method alias ("Normalize=Normalize_406C20"): rename the call, '.' or '->'
+            for (auto& a : aliases) {
+                if (a.op.empty() || !(std::isalpha((unsigned char)a.op[0]) || a.op[0] == '_') || a.op == "neg")
+                    continue;
+                std::string to = name == a.op ? a.method : name == a.method ? a.op : "";
+                if (!to.empty() && !emitReplace(f, emit, callee.e - 1, callee.e, to)) return false;
+            }
+            if (f.t(obj.e) != ".") return true;
             for (auto& a : aliases) {
                 if (a.method != name) continue;
                 std::string text;

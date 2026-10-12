@@ -246,6 +246,102 @@ const std::vector<Sample>& samples() {
 {
     return a * 8;
 })", {0}},
+        {"bool_assign", R"(void f(u8 keys)
+{
+    gAltDown = (keys & 0x80) != 0;
+})", {0, 1, 2}},
+        {"reuse_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** b = p->history + 1;
+    b[0] = p->car;
+})", {0}},
+        {"split_local", R"(void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+})", {0}},
+        {"inline_use", R"(void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        car->Stop();
+    }
+})", {0, 1}},
+        {"swap_logical", R"(void f(Ped* p, int n)
+{
+    if (n > 0 && p->car != 0)
+    {
+        p->Stop();
+    }
+})", {0}},
+        {"do_while", R"(void f(Ped* p, int n)
+{
+    while (n < p->count)
+    {
+        p->Step(n);
+        n++;
+    }
+})", {0, 1}},
+        {"noop_node", R"(void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = v;
+})", {0, 2}},
+        {"goto_exit", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            break;
+        }
+    }
+    p->Stop();
+})", {0}},
+        {"tail_return", R"(int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+})", {0}},
+        {"dead_wrap", R"(void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+hit:
+    p->Bounce();
+})", {0}},
+        {"switch_dup", R"(void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            break;
+        default:
+            p->x++;
+            break;
+    }
+    p->n++;
+})", {0}},
     };
     return s;
 }

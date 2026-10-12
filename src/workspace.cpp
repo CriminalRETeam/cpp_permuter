@@ -170,7 +170,12 @@ std::vector<Region> inlineCallees(const std::string& srcPath, size_t mainStart, 
                 // the qualified name as written
                 std::string q = text.substr(b, text.find('(', b) - b);
                 q.erase(std::remove_if(q.begin(), q.end(), ::isspace), q.end());
-                perName.back().push_back({file, b, e, q, ""});
+                Region reg;
+                reg.file = file;
+                reg.start = b;
+                reg.end = e;
+                reg.name = q;
+                perName.back().push_back(reg);
             }
         }
     }
@@ -295,6 +300,100 @@ std::vector<Region> globalRegions(const std::string& srcPath, const std::string&
             r.alt = it->second;
         }
         out.push_back(r);
+    }
+    return out;
+}
+
+namespace {
+
+bool identChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+
+} // namespace
+
+std::vector<Region> conventionRegions(const std::vector<std::string>& files,
+                                      const std::set<std::string>& names, int firstLink) {
+    static const char* kConv[] = {"__cdecl", "__stdcall", "__fastcall"};
+    static const std::set<std::string> kNotType = {"return", "new", "delete", "case", "else", "throw",
+                                                   "goto", "sizeof", "do", "typedef", "using", "friend"};
+    std::vector<Region> out;
+    std::map<std::string, int> links;
+    for (auto& file : files) {
+        std::string text;
+        if (!readAll(file, text)) continue;
+        for (auto& name : names) {
+            for (size_t at = text.find(name); at != std::string::npos; at = text.find(name, at + 1)) {
+                size_t e = at + name.size();
+                if ((at > 0 && identChar(text[at - 1])) || (e < text.size() && identChar(text[e]))) continue;
+                size_t k = e;
+                while (k < text.size() && (text[k] == ' ' || text[k] == '\t')) k++;
+                if (k >= text.size() || text[k] != '(') continue;
+                // back over "Class::" qualifiers
+                size_t q = at;
+                while (q >= 2 && text[q - 1] == ':' && text[q - 2] == ':') {
+                    size_t b = q - 2;
+                    while (b > 0 && identChar(text[b - 1])) b--;
+                    if (b == q - 2) break;
+                    q = b;
+                }
+                size_t ls = text.rfind('\n', q == 0 ? 0 : q - 1);
+                ls = ls == std::string::npos ? 0 : ls + 1;
+                std::string prefix = text.substr(ls, q - ls);
+                // only a declaration's specifiers: identifiers, '*', '&', '<', '>', ',' and spaces
+                bool ok = prefix.find_first_not_of(
+                              "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_*&<>, \t") ==
+                          std::string::npos;
+                if (!ok) continue;
+                // tokens of the prefix
+                std::vector<std::pair<size_t, size_t>> toks; // [b, e) offsets in prefix
+                for (size_t i = 0; i < prefix.size();) {
+                    if (prefix[i] == ' ' || prefix[i] == '\t') {
+                        i++;
+                        continue;
+                    }
+                    size_t b = i;
+                    if (identChar(prefix[i]))
+                        while (i < prefix.size() && identChar(prefix[i])) i++;
+                    else
+                        i++;
+                    toks.push_back({b, i});
+                }
+                if (toks.empty()) continue; // a call statement or a constructor
+                // constructors: only specifiers before the name, or 'X::X('
+                static const std::set<std::string> kSpec = {"inline", "__inline", "__forceinline", "explicit",
+                                                            "static", "virtual", "extern"};
+                bool onlySpec = true;
+                for (auto& t : toks) onlySpec &= kSpec.count(prefix.substr(t.first, t.second - t.first)) > 0;
+                if (onlySpec) continue;
+                if (q < at && text.compare(q, name.size(), name) == 0 && at - q == name.size() + 2) continue;
+                std::string first = prefix.substr(toks[0].first, toks[0].second - toks[0].first);
+                if (kNotType.count(first)) continue;
+                size_t rb; // region start in prefix: after the return type
+                auto last = toks.back();
+                std::string lastTok = prefix.substr(last.first, last.second - last.first);
+                bool hasConv = false;
+                for (auto* c : kConv) hasConv |= lastTok == c;
+                if (hasConv) {
+                    if (toks.size() < 2) continue;
+                    rb = toks[toks.size() - 2].second;
+                } else {
+                    rb = last.second;
+                    if (!identChar(lastTok[0]) && lastTok != "*" && lastTok != "&") continue;
+                }
+                Region r;
+                r.file = file;
+                r.start = ls + rb;
+                r.end = q;
+                r.name = "convention " + name;
+                // always the same four choices, in the same order at every site of a function:
+                // no convention, __cdecl, __stdcall, __fastcall
+                r.alts.push_back(r.end > r.start ? " " : "");
+                for (auto* c : kConv) r.alts.push_back(std::string(" ") + c + " ");
+                auto it = links.find(name);
+                if (it == links.end()) it = links.emplace(name, firstLink + (int)links.size()).first;
+                r.link = it->second;
+                out.push_back(r);
+            }
+        }
     }
     return out;
 }

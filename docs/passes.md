@@ -1050,3 +1050,415 @@ s32 f(s32 a)
 }
 ```
 
+## `bool_assign`
+
+'x = a < b;' <-> 'if (a < b) x = 1; else x = 0;' (or 'x = 0; if (a < b) x = 1;'), and 'if (a & 8) x = 1; else x = 0;' -> 'x = (a & 8) != 0;'.
+
+```cpp
+void f(u8 keys)
+{
+    gAltDown = (keys & 0x80) != 0;
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = 1;
+    }
+    else
+    {
+        gAltDown = 0;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    gAltDown = 0;
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = 1;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(u8 keys)
+{
+    if ((keys & 0x80) != 0)
+    {
+        gAltDown = true;
+    }
+    else
+    {
+        gAltDown = false;
+    }
+}
+```
+
+(4 candidates in all for this function.)
+
+## `reuse_local`
+
+Reuse a dead local of the same type for a later one: 'T* b = y;' -> 'a = y;' with b's uses renamed (one variable or two decides which register or slot holds it).
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** b = p->history + 1;
+    b[0] = p->car;
+}
+```
+
+becomes
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+}
+```
+
+## `split_local`
+
+Give a local's later value its own variable: 'a = y;' -> 'T a_2 = y;' with the uses after it renamed (the reverse of reuse_local).
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    a = p->history + 1;
+    a[0] = p->car;
+}
+```
+
+becomes
+
+```cpp
+void f(Player* p)
+{
+    Car** a = p->history;
+    a[0] = 0;
+    Car** a_2 = p->history + 1;
+    a_2[0] = p->car;
+}
+```
+
+## `inline_use`
+
+Read a local's (side effect free) initializer again at one of its uses instead of the local: 'T x = p->f; a(x); b(x);' -> 'T x = p->f; a(x); b(p->f);'.
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        car->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (p->car)
+    {
+        car->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p)
+{
+    Car* car = p->car;
+    if (car)
+    {
+        p->car->Stop();
+    }
+}
+```
+
+## `swap_logical`
+
+'a && b' <-> 'b && a' (and ||) when neither side has side effects (calls are allowed: read the diff): which test VC6 lays out first.
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (n > 0 && p->car != 0)
+    {
+        p->Stop();
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (p->car != 0 && n > 0)
+    {
+        p->Stop();
+    }
+}
+```
+
+## `do_while`
+
+'while (c) B' <-> 'if (c) { do B while (c); }', and 'while (c) B' -> 'do B while (c);' (only if the loop always runs once: read the diff).
+
+```cpp
+void f(Ped* p, int n)
+{
+    while (n < p->count)
+    {
+        p->Step(n);
+        n++;
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    if (n < p->count)
+    {
+        do
+        {
+            p->Step(n);
+            n++;
+        } while (n < p->count);
+    }
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    do
+    {
+        p->Step(n);
+        n++;
+    } while (n < p->count);
+}
+```
+
+## `noop_node`
+
+Add or drop parentheses that change nothing, or an '(f32)' cast of an f32 value: no-op tree nodes move the x87 scheduler's 81-node windows.
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = v;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = (s * 2.0f) + p->speed;
+    p->speed = v;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, f32 s)
+{
+    f32 v = s * 2.0f + p->speed;
+    p->speed = (f32)v;
+}
+```
+
+(3 candidates in all for this function.)
+
+## `goto_exit`
+
+'break;' <-> 'goto loop_exit;' with the label after the loop (all breaks or one): a break's exit is a jump-only block whose jumps VC6 retargets.
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            break;
+        }
+    }
+    p->Stop();
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto loop_exit;
+        }
+    }
+    loop_exit:
+    p->Stop();
+}
+```
+
+## `tail_return`
+
+Copy the return after an if into the end of one branch ('return;' for an if that ends a void function), or drop such a copy: which tail VC6's cross-jumping keeps.
+
+```cpp
+int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+}
+```
+
+becomes
+
+```cpp
+int f(Ped* p)
+{
+    if (p->car)
+    {
+        p->a = 1;
+        return p->b;
+    }
+    else
+    {
+        p->a = 2;
+    }
+    return p->b;
+}
+```
+
+(2 candidates in all for this function.)
+
+## `dead_wrap`
+
+Wrap a loop and the statements after it up to a return/goto in 'while (1) { }' or 'if (1) { }', or unwrap one: the dead exit edge changes VC6's RPO block order.
+
+```cpp
+void f(Ped* p, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+hit:
+    p->Bounce();
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int n)
+{
+    while (1) {
+    for (int i = 0; i < n; i++)
+    {
+        if (p->Hit(i))
+        {
+            goto hit;
+        }
+    }
+    p->Stop();
+    return;
+}
+hit:
+    p->Bounce();
+}
+```
+
+(2 candidates in all for this function.)
+
+## `switch_dup`
+
+Run the statement after a switch in each case before its break (adding a default for it if there is none), or hoist a statement every break shares out of the switch: per-case tails.
+
+```cpp
+void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            break;
+        default:
+            p->x++;
+            break;
+    }
+    p->n++;
+}
+```
+
+becomes
+
+```cpp
+void f(Ped* p, int d)
+{
+    switch (d)
+    {
+        case 0:
+            p->x--;
+            p->n++;
+            break;
+        default:
+            p->x++;
+            p->n++;
+            break;
+    }
+}
+```
+

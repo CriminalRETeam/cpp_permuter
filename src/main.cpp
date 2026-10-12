@@ -82,6 +82,10 @@ Other functions (for helpers VC6 inlines into the target):
       --op-alias OP=NAME    for named_op: operator OP ("*", "+", ..., "neg" for unary
                             minus) also exists as the method NAME, e.g.
                             "*=Multiply_408680". Repeatable
+      --auto-method-aliases for named_op: each method "Name" the function calls that also
+                            exists as "Name_ADDRESS" (or the other way round) is an
+                            alias, like --op-alias Name=Name_ADDRESS: an inline method and
+                            its named out-of-line copy (an OP can also be a method name)
       --inline-callees      also permute the inline functions the target calls: their
                             definitions in the source (if marked inline) and in the
                             headers it includes
@@ -91,6 +95,11 @@ Other functions (for helpers VC6 inlines into the target):
                             extern as its definition (taken from another .cpp in the
                             source's directory). VC6 can code a global defined in the same
                             file differently (see README)
+      --calling-conventions also try the function and the functions it calls declared
+                            with another calling convention (none, __cdecl, __stdcall,
+                            __fastcall), at every declaration in the source and its headers
+                            at once. It changes calls and VC6's scheduling after them, even
+                            without parameters (see README)
       --global-macros D=E   the macros of those declarations (default
                             DEFINE_GLOBAL=EXTERN_GLOBAL, gta2_re's Function.hpp)
   -I, --include-dir DIR     where to look for #include "..." headers besides the
@@ -147,6 +156,8 @@ struct Options {
     bool resume = false;
     std::vector<std::string> also, includeDirs, checkParse, opAliases;
     bool externGlobals = false;
+    bool callingConventions = false;
+    bool autoMethodAliases = false;
     std::string globalMacros = "DEFINE_GLOBAL=EXTERN_GLOBAL";
     bool inlineCallees = false, listRegions = false, checkMode = false, showTimings = false, listDefs = false,
          passExamples = false;
@@ -231,6 +242,8 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
     if (key == "op-alias") return need() && (o.opAliases.push_back(val), true);
     if (key == "inline-callees") return o.inlineCallees = true;
     if (key == "extern-globals") return o.externGlobals = true;
+    if (key == "calling-conventions") return o.callingConventions = true;
+    if (key == "auto-method-aliases") return o.autoMethodAliases = true;
     if (key == "global-macros") return need() && (o.globalMacros = val, true);
     if (key == "max-callees") return num(o.maxCallees);
     if (key == "include-dir" || key == "I") return need() && (o.includeDirs.push_back(val), true);
@@ -253,7 +266,7 @@ bool applyOption(Options& o, const std::string& key, const std::string& val, boo
 bool isFlag(const std::string& k) {
     static const std::set<std::string> flags = {
         "ignore-reloc-names", "keep-going", "list-passes", "show-ast", "dry-run",
-        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals",
+        "show-base-diff", "verbose", "v", "inline-callees", "list-regions", "check-parse", "show-timings", "list-definitions", "keep-ties", "base-only", "pass-examples", "resume", "extern-globals", "calling-conventions", "auto-method-aliases",
     };
     return flags.count(k) > 0;
 }
@@ -734,6 +747,28 @@ std::string toggledGlobal(const Workspace& ws, const Cand& c, size_t r) {
     return c[r] == ws.base[r] ? ws.regions[r].alt : ws.base[r];
 }
 
+std::string noSpace(const std::string& s) {
+    std::string r;
+    for (char ch : s)
+        if (!std::isspace((unsigned char)ch)) r += ch;
+    return r;
+}
+
+// The calling convention a convention site holds in c (an index into its alts), or -1.
+int conventionChoice(const Workspace& ws, const Cand& c, size_t r) {
+    auto& alts = ws.regions[r].alts;
+    for (size_t i = 0; i < alts.size(); ++i)
+        if (noSpace(alts[i]) == noSpace(c[r])) return (int)i;
+    return -1;
+}
+
+// Sets every site of r's function to the same calling convention.
+void setConvention(const Workspace& ws, Cand& c, size_t r, int choice) {
+    for (size_t j = 0; j < c.size(); ++j)
+        if (ws.regions[j].link == ws.regions[r].link && !ws.regions[j].alts.empty())
+            c[j] = ws.regions[j].alts[choice];
+}
+
 Cand randomCandidate(const Options& o, const Workspace& ws, const std::vector<PassGroup>& groups,
                      const Cand& start, Rng& rng) {
     int total = 0;
@@ -742,11 +777,19 @@ Cand randomCandidate(const Options& o, const Workspace& ws, const std::vector<Pa
     int k = std::uniform_int_distribution<int>(1, std::max(1, o.maxMutations))(rng);
     Cand c = start;
     std::vector<size_t> funcs, globals; // regions by kind; funcs[0] is the target
-    for (size_t i = 0; i < c.size(); ++i) (ws.regions[i].alt.empty() ? funcs : globals).push_back(i);
+    for (size_t i = 0; i < c.size(); ++i) (ws.regions[i].isToggle() ? globals : funcs).push_back(i);
     for (int m = 0; m < k; ++m) {
         // a global's declaration: one mutation in eight
         if (!globals.empty() && std::uniform_int_distribution<int>(0, 7)(rng) == 0) {
             size_t g = globals[std::uniform_int_distribution<size_t>(0, globals.size() - 1)(rng)];
+            if (!ws.regions[g].alts.empty()) {
+                int n = (int)ws.regions[g].alts.size();
+                int cur = conventionChoice(ws, c, g);
+                int pick = std::uniform_int_distribution<int>(0, n - 2)(rng);
+                if (cur >= 0 && pick >= cur) pick++;
+                setConvention(ws, c, g, pick);
+                continue;
+            }
             c[g] = toggledGlobal(ws, c, g);
             continue;
         }
@@ -892,6 +935,18 @@ void enumerateCand(const Workspace& ws, const std::vector<PassGroup>& groups, co
                    const std::function<bool(const Cand&, const std::string&)>& emit) {
     bool stop = false;
     for (size_t r = 0; r < c.size() && !stop; ++r) {
+        if (!ws.regions[r].alts.empty()) {
+            bool seen = false; // one site per function
+            for (size_t j = 0; j < r; ++j) seen |= ws.regions[j].link == ws.regions[r].link;
+            int cur = conventionChoice(ws, c, r);
+            for (int k = 0; k < (int)ws.regions[r].alts.size() && !seen && !stop; ++k) {
+                if (k == cur) continue;
+                Cand n = c;
+                setConvention(ws, n, r, k);
+                if (!emit(n, "calling_convention")) stop = true;
+            }
+            continue;
+        }
         if (!ws.regions[r].alt.empty()) {
             Cand n = c;
             n[r] = toggledGlobal(ws, c, r);
@@ -1255,13 +1310,23 @@ int main(int argc, char** argv) {
         for (auto& r : globalRegions(srcPath, text, names, o.globalMacros.substr(0, eq), o.globalMacros.substr(eq + 1)))
             addRegion(r);
     }
+    if (o.callingConventions) {
+        std::set<std::string> names = calledNames(*func);
+        std::string self = o.function.substr(o.function.rfind(':') == std::string::npos ? 0 : o.function.rfind(':') + 1);
+        names.insert(self);
+        std::vector<std::string> files = {srcPath};
+        for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+        int link = 0;
+        for (auto& r : ws.regions) link = std::max(link, r.link + 1);
+        for (auto& r : conventionRegions(files, names, link)) addRegion(r);
+    }
     for (auto& r : ws.regions) {
         if (!ws.files.count(r.file) && !readFile(r.file, ws.files[r.file])) {
             std::cerr << "error: can't read " << r.file << "\n";
             return 1;
         }
         std::string text = ws.files[r.file].substr(r.start, r.end - r.start);
-        if (!r.alt.empty()) { // a global's declaration, not a function
+        if (r.isToggle()) { // a global's declaration or a calling convention, not a function
             ws.base.push_back(text);
             continue;
         }
@@ -1316,6 +1381,38 @@ int main(int argc, char** argv) {
                 return 1;
             }
             as.push_back({spec.substr(0, eq), spec.substr(eq + 1)});
+        }
+        if (o.autoMethodAliases) {
+            // "Name" and "Name_4086A0" both declared in the source or its headers, and one of them
+            // called by the function: an inline method and its named out-of-line copy
+            std::set<std::string> declared;
+            std::vector<std::string> files = {srcPath};
+            for (auto& h : includedFiles(srcPath, dirs)) files.push_back(h);
+            for (auto& file : files) {
+                std::string text;
+                if (!readFile(file, text)) continue;
+                auto toks = lex(text);
+                for (size_t i = 0; i + 1 < toks.size(); ++i)
+                    if (toks[i].kind == TokKind::Ident && toks[i + 1].text == "(") declared.insert(toks[i].text);
+            }
+            std::set<std::string> called;
+            for (auto& r : ws.regions)
+                if (!r.isToggle()) {
+                    std::string ferr;
+                    auto fn = parseFunc(ws.base[&r - &ws.regions[0]], ferr);
+                    if (fn)
+                        for (auto& n : calledNames(*fn)) called.insert(n);
+                }
+            for (auto& n : declared) {
+                if (n.size() < 8 || n[n.size() - 7] != '_') continue;
+                bool hex = true;
+                for (size_t i = n.size() - 6; i < n.size(); ++i) hex &= std::isxdigit((unsigned char)n[i]) != 0;
+                std::string base = n.substr(0, n.size() - 7);
+                if (!hex || base.empty() || !declared.count(base)) continue;
+                if (!called.count(n) && !called.count(base)) continue;
+                as.push_back({base, n});
+                if (o.verbose) std::cout << "method alias: " << base << " = " << n << "\n";
+            }
         }
         setOpAliases(as);
     }
